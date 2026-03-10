@@ -1,82 +1,102 @@
+from fastapi import FastAPI, Depends, HTTPException, Query
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import StreamingResponse
-import aiosqlite
-from models import VendorCreate, ChecklistAnswers, VendorResponse, EvaluationResponse
+import aiosqlite, json
+from models import VendorCreate, VendorResponse, VendorUpdate, EvaluationCreate, EvaluationResponse
 from engine import (
-    init_db, create_vendor, list_vendors, get_vendor, evaluate_vendor,
-    list_evaluations, get_evaluation_stats, export_evaluations_csv,
+    init_db, create_vendor, list_vendors, get_vendor,
+    create_evaluation, list_evaluations, get_evaluation,
+    get_evaluation_stats, export_evaluations_csv,
+    update_vendor, compare_vendors
 )
+from fastapi.responses import StreamingResponse
+from typing import List, Optional
 
 DB_PATH = "vendorcheck.db"
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with aiosqlite.connect(DB_PATH) as db:
-        await init_db()
+        await init_db(db)
     yield
 
-
-app = FastAPI(title="VendorCheck", version="1.1.0", lifespan=lifespan)
-
+app = FastAPI(title="VendorCheck API", version="1.2.0", lifespan=lifespan)
 
 async def get_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         yield db
 
 
 @app.post("/vendors", response_model=VendorResponse, status_code=201)
 async def add_vendor(body: VendorCreate, db=Depends(get_db)):
-    return await create_vendor(db, body.name, body.vendor_url, body.use_case)
+    return await create_vendor(db, body)
 
 
-@app.get("/vendors", response_model=list[VendorResponse])
+# compare BEFORE /{vendor_id} to avoid route conflict
+@app.get("/vendors/compare")
+async def compare_vendors_endpoint(
+    ids: str = Query(..., description="Comma-separated vendor IDs"),
+    db=Depends(get_db)
+):
+    try:
+        vendor_ids = [int(x.strip()) for x in ids.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="ids must be comma-separated integers")
+    if len(vendor_ids) < 2:
+        raise HTTPException(status_code=400, detail="Provide at least 2 vendor IDs to compare")
+    return await compare_vendors(db, vendor_ids)
+
+
+@app.get("/vendors", response_model=List[VendorResponse])
 async def get_vendors(db=Depends(get_db)):
     return await list_vendors(db)
 
 
 @app.get("/vendors/{vendor_id}", response_model=VendorResponse)
-async def get_vendor_by_id(vendor_id: int, db=Depends(get_db)):
-    vendor = await get_vendor(db, vendor_id)
-    if not vendor:
+async def get_vendor_endpoint(vendor_id: int, db=Depends(get_db)):
+    v = await get_vendor(db, vendor_id)
+    if not v:
         raise HTTPException(status_code=404, detail="Vendor not found")
-    return vendor
+    return v
 
 
-@app.post("/vendors/{vendor_id}/evaluate", response_model=EvaluationResponse, status_code=201)
-async def run_evaluation(vendor_id: int, body: ChecklistAnswers, db=Depends(get_db)):
-    vendor = await get_vendor(db, vendor_id)
-    if not vendor:
+@app.patch("/vendors/{vendor_id}", response_model=VendorResponse)
+async def patch_vendor(vendor_id: int, body: VendorUpdate, db=Depends(get_db)):
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    v = await update_vendor(db, vendor_id, updates)
+    if not v:
         raise HTTPException(status_code=404, detail="Vendor not found")
-    return await evaluate_vendor(db, vendor_id, body.model_dump())
+    return v
 
 
-@app.get("/vendors/{vendor_id}/evaluations", response_model=list[EvaluationResponse])
-async def get_vendor_evaluations(vendor_id: int, db=Depends(get_db)):
-    vendor = await get_vendor(db, vendor_id)
-    if not vendor:
-        raise HTTPException(status_code=404, detail="Vendor not found")
-    return await list_evaluations(db, vendor_id=vendor_id)
+@app.post("/evaluations", response_model=EvaluationResponse, status_code=201)
+async def add_evaluation(body: EvaluationCreate, db=Depends(get_db)):
+    return await create_evaluation(db, body)
 
 
+# stats and export BEFORE /{eval_id} to avoid route conflict
 @app.get("/evaluations/stats")
 async def evaluation_stats(db=Depends(get_db)):
-    """Aggregate stats across all evaluations: count by risk level, avg score, most common compliance failures."""
     return await get_evaluation_stats(db)
 
 
 @app.get("/evaluations/export/csv")
 async def evaluations_csv(db=Depends(get_db)):
-    """Export all evaluations as CSV for procurement reporting and auditing."""
-    csv_data = await export_evaluations_csv(db)
-    return StreamingResponse(
-        iter([csv_data]),
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=vendorcheck_evaluations.csv"},
-    )
+    data = await export_evaluations_csv(db)
+    return StreamingResponse(iter([data]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=evaluations.csv"})
 
 
-@app.get("/evaluations", response_model=list[EvaluationResponse])
-async def get_all_evaluations(db=Depends(get_db)):
-    return await list_evaluations(db)
+@app.get("/evaluations", response_model=List[EvaluationResponse])
+async def get_evaluations(vendor_id: Optional[int] = None, db=Depends(get_db)):
+    return await list_evaluations(db, vendor_id)
+
+
+@app.get("/evaluations/{eval_id}", response_model=EvaluationResponse)
+async def get_evaluation_endpoint(eval_id: int, db=Depends(get_db)):
+    e = await get_evaluation(db, eval_id)
+    if not e:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+    return e

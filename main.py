@@ -1,8 +1,12 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 import aiosqlite
 from models import VendorCreate, ChecklistAnswers, VendorResponse, EvaluationResponse
-from engine import init_db, create_vendor, list_vendors, get_vendor, evaluate_vendor, list_evaluations
+from engine import (
+    init_db, create_vendor, list_vendors, get_vendor, evaluate_vendor,
+    list_evaluations, get_evaluation_stats, export_evaluations_csv,
+)
 
 DB_PATH = "vendorcheck.db"
 
@@ -14,7 +18,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="VendorCheck", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="VendorCheck", version="1.1.0", lifespan=lifespan)
 
 
 async def get_db():
@@ -54,6 +58,23 @@ async def get_vendor_evaluations(vendor_id: int, db=Depends(get_db)):
     if not vendor:
         raise HTTPException(status_code=404, detail="Vendor not found")
     return await list_evaluations(db, vendor_id=vendor_id)
+
+
+@app.get("/evaluations/stats")
+async def evaluation_stats(db=Depends(get_db)):
+    """Aggregate stats across all evaluations: count by risk level, avg score, most common compliance failures."""
+    return await get_evaluation_stats(db)
+
+
+@app.get("/evaluations/export/csv")
+async def evaluations_csv(db=Depends(get_db)):
+    """Export all evaluations as CSV for procurement reporting and auditing."""
+    csv_data = await export_evaluations_csv(db)
+    return StreamingResponse(
+        iter([csv_data]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=vendorcheck_evaluations.csv"},
+    )
 
 
 @app.get("/evaluations", response_model=list[EvaluationResponse])

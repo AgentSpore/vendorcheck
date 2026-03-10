@@ -139,6 +139,20 @@ async def create_vendor(db, name: str, vendor_url, use_case) -> dict:
     return {"id": cur.lastrowid, "name": name, "vendor_url": vendor_url, "use_case": use_case, "created_at": now}
 
 
+async def update_vendor(db, vendor_id: int, updates: dict) -> dict | None:
+    allowed = {"name", "vendor_url", "use_case"}
+    fields = {k: v for k, v in updates.items() if k in allowed}
+    if not fields:
+        return await get_vendor(db, vendor_id)
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [vendor_id]
+    cur = await db.execute(f"UPDATE vendors SET {set_clause} WHERE id=?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_vendor(db, vendor_id)
+
+
 async def list_vendors(db) -> list:
     cur = await db.execute("SELECT id, name, vendor_url, use_case, created_at FROM vendors ORDER BY id DESC")
     rows = await cur.fetchall()
@@ -149,6 +163,52 @@ async def get_vendor(db, vendor_id: int):
     cur = await db.execute("SELECT id, name, vendor_url, use_case, created_at FROM vendors WHERE id=?", (vendor_id,))
     r = await cur.fetchone()
     return {"id": r[0], "name": r[1], "vendor_url": r[2], "use_case": r[3], "created_at": r[4]} if r else None
+
+
+async def compare_vendors(db, vendor_ids: list[int]) -> list[dict]:
+    """Compare vendors side-by-side using their latest evaluation per vendor."""
+    result = []
+    for vid in vendor_ids:
+        vendor = await get_vendor(db, vid)
+        if not vendor:
+            continue
+        cur = await db.execute(
+            """SELECT e.id, e.total_score, e.risk_level, e.passed, e.failed,
+                      e.critical_fails, e.recommendations, e.created_at
+               FROM evaluations e WHERE e.vendor_id=? ORDER BY e.id DESC LIMIT 1""",
+            (vid,),
+        )
+        row = await cur.fetchone()
+        if row:
+            result.append({
+                "vendor_id": vid,
+                "vendor_name": vendor["name"],
+                "vendor_url": vendor["vendor_url"],
+                "use_case": vendor["use_case"],
+                "latest_score": row[1],
+                "risk_level": row[2],
+                "passed": row[3],
+                "failed": row[4],
+                "critical_fails": json.loads(row[5]),
+                "top_recommendations": json.loads(row[6])[:3],
+                "evaluated_at": row[7],
+            })
+        else:
+            result.append({
+                "vendor_id": vid,
+                "vendor_name": vendor["name"],
+                "vendor_url": vendor["vendor_url"],
+                "use_case": vendor["use_case"],
+                "latest_score": None,
+                "risk_level": None,
+                "passed": None,
+                "failed": None,
+                "critical_fails": [],
+                "top_recommendations": [],
+                "evaluated_at": None,
+            })
+    result.sort(key=lambda x: (x["latest_score"] or -1), reverse=True)
+    return result
 
 
 async def evaluate_vendor(db, vendor_id: int, answers: dict) -> dict:

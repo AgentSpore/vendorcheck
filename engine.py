@@ -130,7 +130,6 @@ def _score(answers: dict) -> dict:
 
 
 async def create_vendor(db, name: str, vendor_url, use_case) -> dict:
-    from datetime import datetime
     now = datetime.utcnow().isoformat()
     cur = await db.execute(
         "INSERT INTO vendors (name, vendor_url, use_case, created_at) VALUES (?,?,?,?)",
@@ -153,7 +152,6 @@ async def get_vendor(db, vendor_id: int):
 
 
 async def evaluate_vendor(db, vendor_id: int, answers: dict) -> dict:
-    from datetime import datetime
     result = _score(answers)
     now = datetime.utcnow().isoformat()
     cur = await db.execute(
@@ -186,20 +184,65 @@ async def evaluate_vendor(db, vendor_id: int, answers: dict) -> dict:
 async def list_evaluations(db, vendor_id=None) -> list:
     if vendor_id:
         cur = await db.execute(
-            "SELECT id, vendor_id, total_score, risk_level, passed, failed, critical_fails, recommendations, created_at FROM evaluations WHERE vendor_id=? ORDER BY id DESC",
+            "SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level, e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id WHERE e.vendor_id=? ORDER BY e.id DESC",
             (vendor_id,),
         )
     else:
         cur = await db.execute(
-            "SELECT id, vendor_id, total_score, risk_level, passed, failed, critical_fails, recommendations, created_at FROM evaluations ORDER BY id DESC"
+            "SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level, e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id ORDER BY e.id DESC"
         )
     rows = await cur.fetchall()
     return [
         {
-            "id": r[0], "vendor_id": r[1], "total_score": r[2], "risk_level": r[3],
-            "passed": r[4], "failed": r[5],
-            "critical_fails": json.loads(r[6]), "recommendations": json.loads(r[7]),
-            "created_at": r[8],
+            "id": r[0], "vendor_id": r[1], "vendor_name": r[2] or "unknown",
+            "total_score": r[3], "risk_level": r[4],
+            "passed": r[5], "failed": r[6],
+            "critical_fails": json.loads(r[7]), "recommendations": json.loads(r[8]),
+            "created_at": r[9],
         }
         for r in rows
     ]
+
+
+async def get_evaluation_stats(db) -> dict:
+    from collections import Counter
+    evals = await list_evaluations(db)
+    if not evals:
+        return {
+            "total": 0, "by_risk": {}, "avg_score": 0.0,
+            "top_critical_fails": [], "top_recommendations": [],
+        }
+    by_risk = dict(Counter(e["risk_level"] for e in evals))
+    avg_score = round(sum(e["total_score"] for e in evals) / len(evals), 1)
+    all_critical = [c for e in evals for c in e["critical_fails"]]
+    all_recs = [r for e in evals for r in e["recommendations"]]
+    top_critical = [{"check": k, "count": v} for k, v in Counter(all_critical).most_common(5)]
+    top_recs = [{"recommendation": k, "count": v} for k, v in Counter(all_recs).most_common(5)]
+    return {
+        "total": len(evals),
+        "by_risk": by_risk,
+        "avg_score": avg_score,
+        "top_critical_fails": top_critical,
+        "top_recommendations": top_recs,
+    }
+
+
+async def export_evaluations_csv(db) -> str:
+    import csv
+    import io
+    evals = await list_evaluations(db)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "id", "vendor_id", "vendor_name", "total_score", "risk_level",
+        "passed", "failed", "critical_fails", "recommendations", "created_at",
+    ])
+    for e in evals:
+        writer.writerow([
+            e["id"], e["vendor_id"], e["vendor_name"], e["total_score"], e["risk_level"],
+            e["passed"], e["failed"],
+            "|".join(e["critical_fails"]),
+            "|".join(e["recommendations"]),
+            e["created_at"],
+        ])
+    return buf.getvalue()

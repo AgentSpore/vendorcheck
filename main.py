@@ -1,12 +1,17 @@
 from fastapi import FastAPI, Depends, HTTPException, Query
 from contextlib import asynccontextmanager
 import aiosqlite, json
-from models import VendorCreate, VendorResponse, VendorUpdate, EvaluationCreate, EvaluationResponse
+from models import (
+    VendorCreate, VendorResponse, VendorUpdate,
+    EvaluationCreate, EvaluationResponse,
+    ChecklistAnswers, AssessmentResponse, VendorHistory,
+)
 from engine import (
     init_db, create_vendor, list_vendors, get_vendor,
     create_evaluation, list_evaluations, get_evaluation,
     get_evaluation_stats, export_evaluations_csv,
-    update_vendor, compare_vendors
+    update_vendor, compare_vendors,
+    assess_vendor, get_vendor_history, delete_vendor, delete_evaluation,
 )
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -19,7 +24,7 @@ async def lifespan(app: FastAPI):
         await init_db(db)
     yield
 
-app = FastAPI(title="VendorCheck API", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="VendorCheck API", version="1.3.0", lifespan=lifespan)
 
 async def get_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -71,6 +76,30 @@ async def patch_vendor(vendor_id: int, body: VendorUpdate, db=Depends(get_db)):
     return v
 
 
+@app.delete("/vendors/{vendor_id}", status_code=204)
+async def remove_vendor(vendor_id: int, db=Depends(get_db)):
+    deleted = await delete_vendor(db, vendor_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+
+
+@app.post("/vendors/{vendor_id}/assess", response_model=AssessmentResponse, status_code=201)
+async def assess_vendor_endpoint(vendor_id: int, body: ChecklistAnswers, db=Depends(get_db)):
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    answers = body.model_dump()
+    return await assess_vendor(db, vendor_id, answers)
+
+
+@app.get("/vendors/{vendor_id}/history", response_model=VendorHistory)
+async def vendor_history_endpoint(vendor_id: int, db=Depends(get_db)):
+    result = await get_vendor_history(db, vendor_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Vendor not found")
+    return result
+
+
 @app.post("/evaluations", response_model=EvaluationResponse, status_code=201)
 async def add_evaluation(body: EvaluationCreate, db=Depends(get_db)):
     return await create_evaluation(db, body)
@@ -100,3 +129,10 @@ async def get_evaluation_endpoint(eval_id: int, db=Depends(get_db)):
     if not e:
         raise HTTPException(status_code=404, detail="Evaluation not found")
     return e
+
+
+@app.delete("/evaluations/{eval_id}", status_code=204)
+async def remove_evaluation(eval_id: int, db=Depends(get_db)):
+    deleted = await delete_evaluation(db, eval_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Evaluation not found")

@@ -165,8 +165,17 @@ async def get_vendor(db, vendor_id: int):
     return {"id": r[0], "name": r[1], "vendor_url": r[2], "use_case": r[3], "created_at": r[4]} if r else None
 
 
+async def delete_vendor(db, vendor_id: int) -> bool:
+    vendor = await get_vendor(db, vendor_id)
+    if not vendor:
+        return False
+    await db.execute("DELETE FROM evaluations WHERE vendor_id=?", (vendor_id,))
+    await db.execute("DELETE FROM vendors WHERE id=?", (vendor_id,))
+    await db.commit()
+    return True
+
+
 async def compare_vendors(db, vendor_ids: list[int]) -> list[dict]:
-    """Compare vendors side-by-side using their latest evaluation per vendor."""
     result = []
     for vid in vendor_ids:
         vendor = await get_vendor(db, vid)
@@ -211,7 +220,7 @@ async def compare_vendors(db, vendor_ids: list[int]) -> list[dict]:
     return result
 
 
-async def evaluate_vendor(db, vendor_id: int, answers: dict) -> dict:
+async def assess_vendor(db, vendor_id: int, answers: dict) -> dict:
     result = _score(answers)
     now = datetime.utcnow().isoformat()
     cur = await db.execute(
@@ -236,9 +245,64 @@ async def evaluate_vendor(db, vendor_id: int, answers: dict) -> dict:
         "id": cur.lastrowid,
         "vendor_id": vendor_id,
         "vendor_name": vendor["name"] if vendor else "unknown",
-        **result,
+        "total_score": result["total_score"],
+        "risk_level": result["risk_level"],
+        "passed": result["passed"],
+        "failed": result["failed"],
+        "critical_fails": result["critical_fails"],
+        "recommendations": result["recommendations"],
         "created_at": now,
     }
+
+
+async def get_vendor_history(db, vendor_id: int) -> dict | None:
+    vendor = await get_vendor(db, vendor_id)
+    if not vendor:
+        return None
+    cur = await db.execute(
+        """SELECT id, total_score, risk_level, created_at
+           FROM evaluations WHERE vendor_id=? ORDER BY id ASC""",
+        (vendor_id,),
+    )
+    rows = await cur.fetchall()
+    points = []
+    prev_score = None
+    for r in rows:
+        delta = (r[1] - prev_score) if prev_score is not None else None
+        points.append({
+            "eval_id": r[0],
+            "total_score": r[1],
+            "risk_level": r[2],
+            "delta": delta,
+            "created_at": r[3],
+        })
+        prev_score = r[1]
+
+    scores = [p["total_score"] for p in points]
+    if len(scores) >= 2:
+        trend = "improving" if scores[-1] > scores[0] else ("declining" if scores[-1] < scores[0] else "stable")
+    else:
+        trend = "insufficient_data"
+
+    return {
+        "vendor_id": vendor_id,
+        "vendor_name": vendor["name"],
+        "evaluations": points,
+        "trend": trend,
+        "latest_score": scores[-1] if scores else None,
+        "best_score": max(scores) if scores else None,
+        "worst_score": min(scores) if scores else None,
+    }
+
+
+async def delete_evaluation(db, eval_id: int) -> bool:
+    cur = await db.execute("DELETE FROM evaluations WHERE id=?", (eval_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def evaluate_vendor(db, vendor_id: int, answers: dict) -> dict:
+    return await assess_vendor(db, vendor_id, answers)
 
 
 async def list_evaluations(db, vendor_id=None) -> list:
@@ -262,6 +326,23 @@ async def list_evaluations(db, vendor_id=None) -> list:
         }
         for r in rows
     ]
+
+
+async def get_evaluation(db, eval_id: int):
+    cur = await db.execute(
+        "SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level, e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id WHERE e.id=?",
+        (eval_id,),
+    )
+    r = await cur.fetchone()
+    if not r:
+        return None
+    return {
+        "id": r[0], "vendor_id": r[1], "vendor_name": r[2] or "unknown",
+        "total_score": r[3], "risk_level": r[4],
+        "passed": r[5], "failed": r[6],
+        "critical_fails": json.loads(r[7]), "recommendations": json.loads(r[8]),
+        "created_at": r[9],
+    }
 
 
 async def get_evaluation_stats(db) -> dict:

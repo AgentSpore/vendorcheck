@@ -10,6 +10,9 @@ from models import (
     RiskAlertsResponse,
     ContractCreate, ContractResponse, ContractUpdate,
     CategoryStats,
+    DependencyCreate, DependencyResponse, CascadeRiskResponse,
+    ComplianceCalendarResponse, ComplianceMatrixResponse,
+    EvalDiffResponse,
 )
 from engine import (
     init_db, create_vendor, list_vendors, get_vendor,
@@ -24,6 +27,9 @@ from engine import (
     get_vendors_due_for_review, VALID_CATEGORIES,
     create_contract, list_contracts, get_contract, update_contract, delete_contract,
     get_expiring_contracts, get_category_stats,
+    add_dependency, list_dependencies, remove_dependency, get_dependency_tree,
+    get_compliance_calendar, get_compliance_matrix,
+    diff_evaluations,
 )
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -42,9 +48,11 @@ app = FastAPI(
     description=(
         "AI vendor risk assessment: checklist scoring, compliance tracking, "
         "notes audit trail, risk alerts, portfolio dashboard, vendor categories, "
-        "review scheduling, contract tracking with renewal alerts."
+        "review scheduling, contract tracking with renewal alerts, "
+        "vendor dependency chains with cascade risk analysis, "
+        "compliance calendar and cross-vendor matrix, assessment diff comparison."
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -255,6 +263,72 @@ async def remove_contract(contract_id: int, db=Depends(get_db)):
         raise HTTPException(404, "Contract not found")
 
 
+# ── Dependencies (v1.7.0) ────────────────────────────────────────────────────
+
+@app.post("/vendors/{vendor_id}/dependencies", response_model=DependencyResponse, status_code=201)
+async def add_vendor_dependency(vendor_id: int, body: DependencyCreate, db=Depends(get_db)):
+    """Add a vendor dependency (supply chain link)."""
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    try:
+        return await add_dependency(db, vendor_id, body.depends_on_id, body.dependency_type, body.description)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/vendors/{vendor_id}/dependencies", response_model=List[DependencyResponse])
+async def get_vendor_dependencies(vendor_id: int, db=Depends(get_db)):
+    """List direct dependencies for a vendor with their risk levels."""
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    return await list_dependencies(db, vendor_id)
+
+
+@app.delete("/vendors/{vendor_id}/dependencies/{dep_id}", status_code=204)
+async def remove_vendor_dependency(vendor_id: int, dep_id: int, db=Depends(get_db)):
+    if not await remove_dependency(db, vendor_id, dep_id):
+        raise HTTPException(404, "Dependency not found")
+
+
+@app.get("/vendors/{vendor_id}/dependency-tree", response_model=CascadeRiskResponse)
+async def vendor_dependency_tree(vendor_id: int, db=Depends(get_db)):
+    """Full dependency tree with cascade risk analysis."""
+    result = await get_dependency_tree(db, vendor_id)
+    if not result:
+        raise HTTPException(404, "Vendor not found")
+    return result
+
+
+# ── Compliance Calendar & Matrix (v1.7.0) ────────────────────────────────────
+
+@app.get("/compliance/calendar", response_model=ComplianceCalendarResponse)
+async def compliance_calendar(
+    within_days: int = Query(90, ge=1, le=365, description="Days ahead to check"),
+    db=Depends(get_db),
+):
+    """Cross-vendor compliance expiration calendar with urgency levels."""
+    return await get_compliance_calendar(db, within_days)
+
+
+@app.get("/compliance/matrix", response_model=ComplianceMatrixResponse)
+async def compliance_matrix(db=Depends(get_db)):
+    """Vendor x framework compliance matrix showing coverage gaps."""
+    return await get_compliance_matrix(db)
+
+
+# ── Assessment Diff (v1.7.0) ─────────────────────────────────────────────────
+
+@app.get("/evaluations/{eval_a}/diff/{eval_b}", response_model=EvalDiffResponse)
+async def evaluation_diff(eval_a: int, eval_b: int, db=Depends(get_db)):
+    """Compare two evaluations field-by-field. Works across different vendors."""
+    result = await diff_evaluations(db, eval_a, eval_b)
+    if not result:
+        raise HTTPException(404, "One or both evaluations not found")
+    return result
+
+
 # ── Tags ──────────────────────────────────────────────────────────────────────
 
 @app.post("/vendors/{vendor_id}/tags", response_model=TagListResponse, status_code=201)
@@ -344,4 +418,4 @@ async def remove_evaluation(eval_id: int, db=Depends(get_db)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.6.0"}
+    return {"status": "ok", "version": "1.7.0"}

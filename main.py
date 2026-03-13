@@ -5,6 +5,9 @@ from models import (
     VendorCreate, VendorResponse, VendorUpdate,
     ChecklistAnswers, AssessmentResponse, VendorHistory,
     TagAdd, TagListResponse, TagSummary, PortfolioRisk,
+    ComplianceCreate, ComplianceResponse,
+    NoteCreate, NoteResponse,
+    RiskAlertsResponse,
 )
 from engine import (
     init_db, create_vendor, list_vendors, get_vendor,
@@ -14,6 +17,8 @@ from engine import (
     assess_vendor, get_vendor_history, delete_vendor, delete_evaluation,
     add_tag, remove_tag, list_all_tags, list_vendors_by_tag,
     get_portfolio_risk,
+    add_compliance, list_compliance, remove_compliance, VALID_FRAMEWORKS, VALID_COMPLIANCE_STATUS,
+    add_note, list_notes, get_risk_alerts,
 )
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -29,8 +34,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="VendorCheck",
-    description="AI vendor risk assessment: checklist scoring, compliance tracking, portfolio risk dashboard, tagging.",
-    version="1.4.0",
+    description="AI vendor risk assessment: checklist scoring, compliance tracking, notes audit trail, risk alerts, portfolio dashboard.",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -106,6 +111,69 @@ async def assess_vendor_endpoint(vendor_id: int, body: ChecklistAnswers, db=Depe
 async def vendor_history_endpoint(vendor_id: int, db=Depends(get_db)):
     result = await get_vendor_history(db, vendor_id)
     if not result:
+        raise HTTPException(404, "Vendor not found")
+    return result
+
+
+# ── Compliance ────────────────────────────────────────────────────────────────
+
+@app.post("/vendors/{vendor_id}/compliance", response_model=ComplianceResponse, status_code=201)
+async def add_vendor_compliance(vendor_id: int, body: ComplianceCreate, db=Depends(get_db)):
+    """Track vendor compliance certifications (GDPR, SOC2, HIPAA, ISO27001, PCI-DSS, CCPA, FedRAMP)."""
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    if body.framework.lower() not in VALID_FRAMEWORKS:
+        raise HTTPException(422, f"Invalid framework. Valid: {', '.join(sorted(VALID_FRAMEWORKS))}")
+    if body.status not in VALID_COMPLIANCE_STATUS:
+        raise HTTPException(422, f"Invalid status. Valid: {', '.join(sorted(VALID_COMPLIANCE_STATUS))}")
+    return await add_compliance(db, vendor_id, body.model_dump())
+
+
+@app.get("/vendors/{vendor_id}/compliance", response_model=List[ComplianceResponse])
+async def get_vendor_compliance(vendor_id: int, db=Depends(get_db)):
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    return await list_compliance(db, vendor_id)
+
+
+@app.delete("/vendors/{vendor_id}/compliance/{framework}", status_code=204)
+async def remove_vendor_compliance(vendor_id: int, framework: str, db=Depends(get_db)):
+    if not await remove_compliance(db, vendor_id, framework):
+        raise HTTPException(404, "Compliance entry not found")
+
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+
+@app.post("/vendors/{vendor_id}/notes", response_model=NoteResponse, status_code=201)
+async def add_vendor_note(vendor_id: int, body: NoteCreate, db=Depends(get_db)):
+    """Append a timestamped note to vendor for audit trail."""
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    return await add_note(db, vendor_id, body.note, body.author)
+
+
+@app.get("/vendors/{vendor_id}/notes", response_model=List[NoteResponse])
+async def get_vendor_notes(vendor_id: int, db=Depends(get_db)):
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    return await list_notes(db, vendor_id)
+
+
+# ── Risk Alerts ───────────────────────────────────────────────────────────────
+
+@app.get("/vendors/{vendor_id}/risk-alerts", response_model=RiskAlertsResponse)
+async def vendor_risk_alerts(
+    vendor_id: int,
+    lookback: int = Query(5, ge=2, le=20, description="Number of recent assessments to analyze"),
+    db=Depends(get_db),
+):
+    """Detect risk degradation: score drops, risk escalation, declining trends, expired compliance."""
+    result = await get_risk_alerts(db, vendor_id, lookback)
+    if result is None:
         raise HTTPException(404, "Vendor not found")
     return result
 
@@ -192,4 +260,4 @@ async def remove_evaluation(eval_id: int, db=Depends(get_db)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.4.0"}
+    return {"status": "ok", "version": "1.5.0"}

@@ -331,3 +331,59 @@ class EvalDiffResponse(BaseModel):
     resolved_critical_fails: List[str]
     new_recommendations: List[str]
     resolved_recommendations: List[str]
+
+
+# ── v1.8.0: Vendor Contacts ──────────────────────────────────────────────────
+
+class ContactCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=150)
+    email: Optional[str] = Field(None, max_length=254)
+    role: Optional[str] = Field(None, max_length=100, description="e.g. Account Manager, CTO, DPO")
+    phone: Optional[str] = Field(None, max_length=30)
+    is_primary: bool = Field(False, description="Mark as primary contact for this vendor")
+
+
+class ContactResponse(BaseModel):
+    id: int
+    vendor_id: int
+    name: str
+    email: Optional[str]
+    role: Optional[str]
+    phone: Optional[str]
+    is_primary: bool
+    created_at: str
+
+
+class ContactUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=150)
+    email: Optional[str] = Field(None, max_length=254)
+    role: Optional[str] = Field(None, max_length=100)
+    phone: Optional[str] = Field(None, max_length=30)
+    is_primary: Optional[bool] = None
+
+
+# ── v1.8.0: Bulk Assessment ──────────────────────────────────────────────────
+
+class BulkAssessmentItem(BaseModel):
+    vendor_id: int
+    answers: ChecklistAnswers
+
+
+class BulkAssessmentRequest(BaseModel):
+    items: List[BulkAssessmentItem] = Field(..., min_length=1, max_length=20)
+
+
+class BulkAssessmentResult(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    total_score: int
+    risk_level: str
+    critical_fails: List[str]
+
+
+class BulkAssessmentResponse(BaseModel):
+    assessed: int
+    skipped: int
+    results: List[BulkAssessmentResult]
+    avg_score: float
+    risk_distribution: dict

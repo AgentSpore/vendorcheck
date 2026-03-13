@@ -13,6 +13,8 @@ from models import (
     DependencyCreate, DependencyResponse, CascadeRiskResponse,
     ComplianceCalendarResponse, ComplianceMatrixResponse,
     EvalDiffResponse,
+    ContactCreate, ContactResponse, ContactUpdate,
+    BulkAssessmentRequest, BulkAssessmentResponse,
 )
 from engine import (
     init_db, create_vendor, list_vendors, get_vendor,
@@ -30,6 +32,8 @@ from engine import (
     add_dependency, list_dependencies, remove_dependency, get_dependency_tree,
     get_compliance_calendar, get_compliance_matrix,
     diff_evaluations,
+    create_contact, list_contacts, update_contact, delete_contact,
+    bulk_assess, export_portfolio_csv,
 )
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -50,9 +54,10 @@ app = FastAPI(
         "notes audit trail, risk alerts, portfolio dashboard, vendor categories, "
         "review scheduling, contract tracking with renewal alerts, "
         "vendor dependency chains with cascade risk analysis, "
-        "compliance calendar and cross-vendor matrix, assessment diff comparison."
+        "compliance calendar and cross-vendor matrix, assessment diff comparison, "
+        "vendor contacts management, bulk assessment, and portfolio CSV export."
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -159,6 +164,15 @@ async def vendor_history_endpoint(vendor_id: int, db=Depends(get_db)):
     if not result:
         raise HTTPException(404, "Vendor not found")
     return result
+
+
+# ── v1.8.0: Bulk Assessment ──────────────────────────────────────────────────
+
+@app.post("/vendors/assess/bulk", response_model=BulkAssessmentResponse, status_code=201)
+async def bulk_assess_endpoint(body: BulkAssessmentRequest, db=Depends(get_db)):
+    """Assess multiple vendors in one request. Returns combined results and summary."""
+    items = [{"vendor_id": i.vendor_id, "answers": i.answers.model_dump()} for i in body.items]
+    return await bulk_assess(db, items)
 
 
 # ── Compliance ────────────────────────────────────────────────────────────────
@@ -329,6 +343,43 @@ async def evaluation_diff(eval_a: int, eval_b: int, db=Depends(get_db)):
     return result
 
 
+# ── v1.8.0: Vendor Contacts ──────────────────────────────────────────────────
+
+@app.post("/vendors/{vendor_id}/contacts", response_model=ContactResponse, status_code=201)
+async def add_vendor_contact(vendor_id: int, body: ContactCreate, db=Depends(get_db)):
+    """Add a contact person for a vendor. Setting is_primary demotes the existing primary."""
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    return await create_contact(db, vendor_id, body.model_dump())
+
+
+@app.get("/vendors/{vendor_id}/contacts", response_model=List[ContactResponse])
+async def get_vendor_contacts(vendor_id: int, db=Depends(get_db)):
+    """List all contacts for a vendor, primary first."""
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    return await list_contacts(db, vendor_id)
+
+
+@app.patch("/contacts/{contact_id}", response_model=ContactResponse)
+async def patch_contact(contact_id: int, body: ContactUpdate, db=Depends(get_db)):
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+    result = await update_contact(db, contact_id, updates)
+    if not result:
+        raise HTTPException(404, "Contact not found")
+    return result
+
+
+@app.delete("/contacts/{contact_id}", status_code=204)
+async def remove_contact(contact_id: int, db=Depends(get_db)):
+    if not await delete_contact(db, contact_id):
+        raise HTTPException(404, "Contact not found")
+
+
 # ── Tags ──────────────────────────────────────────────────────────────────────
 
 @app.post("/vendors/{vendor_id}/tags", response_model=TagListResponse, status_code=201)
@@ -369,6 +420,18 @@ async def vendors_by_tag(tag: str, db=Depends(get_db)):
 @app.get("/portfolio/risk", response_model=PortfolioRisk)
 async def portfolio_risk(db=Depends(get_db)):
     return await get_portfolio_risk(db)
+
+
+# ── v1.8.0: Portfolio CSV Export ─────────────────────────────────────────────
+
+@app.get("/portfolio/export/csv")
+async def portfolio_csv(db=Depends(get_db)):
+    """Export full vendor portfolio (vendors, scores, compliance, contracts, contacts) as CSV."""
+    data = await export_portfolio_csv(db)
+    return StreamingResponse(
+        iter([data]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=vendor_portfolio.csv"},
+    )
 
 
 # ── Category Stats ────────────────────────────────────────────────────────────
@@ -418,4 +481,4 @@ async def remove_evaluation(eval_id: int, db=Depends(get_db)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.7.0"}
+    return {"status": "ok", "version": "1.8.0"}

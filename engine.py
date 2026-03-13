@@ -165,6 +165,23 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_contacts_vendor ON vendor_contacts(vendor_id)"
         )
 
+        # -- v1.9.0: assessment templates table --
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS assessment_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                description TEXT,
+                answers TEXT NOT NULL,
+                category TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                times_used INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_templates_category ON assessment_templates(category)"
+        )
+
         # migrate: add category and next_review_date columns if missing
         cols = await db.execute("PRAGMA table_info(vendors)")
         col_names = {r[1] for r in await cols.fetchall()}
@@ -1422,3 +1439,453 @@ async def export_portfolio_csv(db) -> str:
             len(contacts), primary_name, primary_email,
         ])
     return buf.getvalue()
+
+
+# ── v1.9.0: Vendor Scorecards ───────────────────────────────────────────────
+
+async def generate_scorecard(db, vendor_id: int) -> dict | None:
+    """Generate a comprehensive scorecard for a vendor combining all data sources."""
+    vendor = await get_vendor(db, vendor_id)
+    if not vendor:
+        return None
+
+    # --- Latest evaluation & assessment count ---
+    eval_info = await _get_latest_eval(db, vendor_id)
+    eval_cur = await db.execute(
+        "SELECT id, total_score, risk_level, passed, failed, critical_fails, recommendations, created_at "
+        "FROM evaluations WHERE vendor_id=? ORDER BY id DESC",
+        (vendor_id,),
+    )
+    all_evals = await eval_cur.fetchall()
+    assessment_count = len(all_evals)
+
+    overall_score = None
+    risk_level = None
+    last_assessment_at = None
+    passed_checks = []
+    failed_checks = []
+    critical_fail_list = []
+    recommendations_list = []
+
+    if all_evals:
+        latest = all_evals[0]
+        overall_score = float(latest[1])
+        risk_level = latest[2]
+        last_assessment_at = latest[7]
+
+        # Reconstruct passed/failed field names from the latest eval's answers
+        answers_cur = await db.execute(
+            "SELECT answers FROM evaluations WHERE id=?", (latest[0],)
+        )
+        answers_row = await answers_cur.fetchone()
+        if answers_row and answers_row[0]:
+            answers = json.loads(answers_row[0])
+            for field in FIELD_WEIGHTS:
+                if answers.get(field, False):
+                    passed_checks.append(field)
+                else:
+                    failed_checks.append(field)
+
+        critical_fail_list = json.loads(latest[5]) if latest[5] else []
+        recommendations_list = json.loads(latest[6]) if latest[6] else []
+
+    # --- Compliance score ---
+    compliance = await list_compliance(db, vendor_id)
+    total_frameworks = len(VALID_FRAMEWORKS)
+    certified_count = 0
+    expired_penalty = 0
+    for c in compliance:
+        if c["status"] == "certified":
+            certified_count += 1
+        elif c["status"] == "expired":
+            expired_penalty += 1
+
+    if total_frameworks > 0:
+        compliance_score = round((certified_count / total_frameworks) * 100, 1)
+        # Penalize for each expired certification: -10 points, floor at 0
+        compliance_score = max(0.0, compliance_score - (expired_penalty * 10))
+    else:
+        compliance_score = 0.0
+
+    # --- Contract health score ---
+    contracts = await list_contracts(db, vendor_id)
+    active_contracts = len(contracts)
+    contract_health_score = 0.0
+
+    if contracts:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        health_scores = []
+        for c in contracts:
+            try:
+                days_until = (datetime.strptime(c["renewal_date"], "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days
+            except (ValueError, TypeError):
+                days_until = -1
+
+            if days_until > 90:
+                h = 100.0
+            elif days_until > 30:
+                h = 70.0
+            elif days_until > 0:
+                h = 40.0
+            else:
+                h = 0.0
+
+            # Auto-renew bonus: +10 points (capped at 100)
+            if c.get("auto_renew"):
+                h = min(100.0, h + 10.0)
+
+            health_scores.append(h)
+
+        contract_health_score = round(sum(health_scores) / len(health_scores), 1)
+
+    # --- Data completeness ---
+    completeness_checks = {
+        "has_url": bool(vendor.get("vendor_url")),
+        "has_use_case": bool(vendor.get("use_case")),
+        "has_contacts": len(await list_contacts(db, vendor_id)) > 0,
+        "has_evaluations": assessment_count > 0,
+        "has_compliance": len(compliance) > 0,
+        "has_contracts": active_contracts > 0,
+        "has_tags": len(vendor.get("tags", [])) > 0,
+        "has_notes": len(await list_notes(db, vendor_id)) > 0,
+        "has_review_date": bool(vendor.get("next_review_date")),
+    }
+    filled = sum(1 for v in completeness_checks.values() if v)
+    data_completeness = round((filled / len(completeness_checks)) * 100, 1)
+
+    # --- Dependencies ---
+    deps = await list_dependencies(db, vendor_id)
+    open_dependencies = len(deps)
+
+    # --- Contacts ---
+    contacts_list = await list_contacts(db, vendor_id)
+    contacts_count = len(contacts_list)
+
+    # --- Strengths & weaknesses ---
+    strengths = list(passed_checks)
+    weaknesses = list(failed_checks)
+    for cf in critical_fail_list:
+        if cf not in weaknesses:
+            weaknesses.append(cf)
+
+    # --- Recommendation summary ---
+    recommendation_summary = None
+    if recommendations_list:
+        recommendation_summary = "; ".join(recommendations_list[:5])
+
+    return {
+        "vendor_id": vendor_id,
+        "vendor_name": vendor["name"],
+        "category": vendor.get("category"),
+        "overall_score": overall_score,
+        "risk_level": risk_level,
+        "compliance_score": compliance_score,
+        "contract_health_score": contract_health_score,
+        "data_completeness": data_completeness,
+        "last_assessment_at": last_assessment_at,
+        "assessment_count": assessment_count,
+        "active_contracts": active_contracts,
+        "compliance_certifications": certified_count,
+        "open_dependencies": open_dependencies,
+        "contacts_count": contacts_count,
+        "tags": vendor.get("tags", []),
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "recommendation_summary": recommendation_summary,
+    }
+
+
+# ── v1.9.0: Assessment Templates ────────────────────────────────────────────
+
+def _template_row(r) -> dict:
+    """Convert a raw assessment_templates row to a dict."""
+    if not r:
+        return {}
+    return {
+        "id": r[0],
+        "name": r[1],
+        "description": r[2],
+        "answers": json.loads(r[3]) if isinstance(r[3], str) else r[3],
+        "category": r[4],
+        "tags": json.loads(r[5]) if isinstance(r[5], str) else r[5],
+        "times_used": r[6],
+        "created_at": r[7],
+    }
+
+
+async def create_assessment_template(db, data: dict) -> dict:
+    """Create a new assessment template with pre-filled answers."""
+    now = datetime.utcnow().isoformat()
+    answers_json = json.dumps(data["answers"]) if isinstance(data["answers"], dict) else data["answers"]
+    tags_json = json.dumps(data.get("tags") or [])
+    try:
+        cur = await db.execute(
+            """INSERT INTO assessment_templates (name, description, answers, category, tags, times_used, created_at)
+               VALUES (?,?,?,?,?,0,?)""",
+            (data["name"], data.get("description"), answers_json,
+             data.get("category"), tags_json, now),
+        )
+        await db.commit()
+    except Exception:
+        raise ValueError(f"Template with name '{data['name']}' already exists")
+    return await get_assessment_template(db, cur.lastrowid)
+
+
+async def list_assessment_templates(db, category: str | None = None) -> list[dict]:
+    """List all templates, optionally filtered by category."""
+    if category:
+        cur = await db.execute(
+            "SELECT * FROM assessment_templates WHERE category = ? ORDER BY name ASC",
+            (category,),
+        )
+    else:
+        cur = await db.execute(
+            "SELECT * FROM assessment_templates ORDER BY name ASC"
+        )
+    rows = await cur.fetchall()
+    return [_template_row(r) for r in rows]
+
+
+async def get_assessment_template(db, template_id: int) -> dict | None:
+    """Get a single assessment template by ID."""
+    cur = await db.execute(
+        "SELECT * FROM assessment_templates WHERE id=?", (template_id,)
+    )
+    r = await cur.fetchone()
+    if not r:
+        return None
+    return _template_row(r)
+
+
+async def update_assessment_template(db, template_id: int, updates: dict) -> dict | None:
+    """Update an existing assessment template."""
+    existing = await get_assessment_template(db, template_id)
+    if not existing:
+        return None
+
+    allowed = {"name", "description", "answers", "category", "tags"}
+    fields = {}
+    for k, v in updates.items():
+        if k in allowed and v is not None:
+            if k == "answers":
+                fields[k] = json.dumps(v) if isinstance(v, dict) else v
+            elif k == "tags":
+                fields[k] = json.dumps(v) if isinstance(v, list) else v
+            else:
+                fields[k] = v
+
+    if not fields:
+        return existing
+
+    # Check name uniqueness if name is being changed
+    if "name" in fields and fields["name"] != existing["name"]:
+        dup_cur = await db.execute(
+            "SELECT id FROM assessment_templates WHERE name = ? AND id != ?",
+            (fields["name"], template_id),
+        )
+        if await dup_cur.fetchone():
+            raise ValueError(f"Template with name '{fields['name']}' already exists")
+
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [template_id]
+    cur = await db.execute(f"UPDATE assessment_templates SET {set_clause} WHERE id=?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_assessment_template(db, template_id)
+
+
+async def delete_assessment_template(db, template_id: int) -> bool:
+    """Delete an assessment template."""
+    cur = await db.execute("DELETE FROM assessment_templates WHERE id=?", (template_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def apply_assessment_template(db, template_id: int, vendor_id: int) -> dict:
+    """Apply a template to a vendor: run assessment using the template's answers, increment times_used."""
+    template = await get_assessment_template(db, template_id)
+    if not template:
+        raise ValueError(f"Assessment template {template_id} not found")
+
+    vendor = await get_vendor(db, vendor_id)
+    if not vendor:
+        raise ValueError(f"Vendor {vendor_id} not found")
+
+    # Run the assessment using the template's answers
+    answers = template["answers"]
+    if isinstance(answers, str):
+        answers = json.loads(answers)
+
+    result = await assess_vendor(db, vendor_id, answers)
+
+    # Increment times_used
+    await db.execute(
+        "UPDATE assessment_templates SET times_used = times_used + 1 WHERE id = ?",
+        (template_id,),
+    )
+    await db.commit()
+
+    return result
+
+
+# ── v1.9.0: Vendor Benchmarking ─────────────────────────────────────────────
+
+async def get_vendor_benchmark(db, vendor_id: int) -> dict | None:
+    """Compare vendor metrics against category averages and compute percentile/rank."""
+    vendor = await get_vendor(db, vendor_id)
+    if not vendor:
+        return None
+
+    category = vendor.get("category")
+    if not category:
+        # Vendors without a category: benchmark against all uncategorized vendors
+        cat_cur = await db.execute(
+            "SELECT id FROM vendors WHERE category IS NULL"
+        )
+    else:
+        cat_cur = await db.execute(
+            "SELECT id FROM vendors WHERE category = ?", (category,)
+        )
+    category_vendor_rows = await cat_cur.fetchall()
+    category_vendor_ids = [r[0] for r in category_vendor_rows]
+    total_in_category = len(category_vendor_ids)
+
+    if total_in_category < 1:
+        return {
+            "vendor_id": vendor_id,
+            "vendor_name": vendor["name"],
+            "category": category,
+            "total_vendors_in_category": 0,
+            "metrics": [],
+            "overall_percentile": None,
+            "rank": None,
+        }
+
+    # Gather metrics for all vendors in the same category
+    vendor_data = {}
+    for vid in category_vendor_ids:
+        eval_info = await _get_latest_eval(db, vid)
+        compliance = await list_compliance(db, vid)
+        contracts = await list_contracts(db, vid)
+        contacts = await list_contacts(db, vid)
+
+        # Get critical_fails count from latest evaluation
+        crit_count = 0
+        if eval_info:
+            crit_cur = await db.execute(
+                "SELECT critical_fails FROM evaluations WHERE vendor_id=? ORDER BY id DESC LIMIT 1",
+                (vid,),
+            )
+            crit_row = await crit_cur.fetchone()
+            if crit_row and crit_row[0]:
+                crit_count = len(json.loads(crit_row[0]))
+
+        certified_count = sum(1 for c in compliance if c["status"] == "certified")
+        total_contract_value = sum(c["contract_value"] for c in contracts)
+
+        vendor_data[vid] = {
+            "overall_score": eval_info["score"] if eval_info else None,
+            "compliance_certifications_count": certified_count,
+            "critical_fails_count": crit_count,
+            "contract_total_value": total_contract_value,
+            "contacts_count": len(contacts),
+        }
+
+    # Define metrics to compare
+    metric_defs = [
+        {"name": "overall_score", "higher_is_better": True},
+        {"name": "compliance_certifications_count", "higher_is_better": True},
+        {"name": "critical_fails_count", "higher_is_better": False},
+        {"name": "contract_total_value", "higher_is_better": True},
+        {"name": "contacts_count", "higher_is_better": True},
+    ]
+
+    this_vendor = vendor_data.get(vendor_id, {})
+    metrics = []
+    percentile_values = []
+
+    for mdef in metric_defs:
+        metric_name = mdef["name"]
+        higher_is_better = mdef["higher_is_better"]
+
+        all_values = [
+            vendor_data[vid][metric_name]
+            for vid in category_vendor_ids
+            if vendor_data[vid][metric_name] is not None
+        ]
+        vendor_value = this_vendor.get(metric_name)
+
+        if not all_values or vendor_value is None:
+            metrics.append({
+                "metric_name": metric_name,
+                "vendor_value": vendor_value,
+                "category_avg": round(sum(v for v in all_values if v is not None) / len(all_values), 1) if all_values else None,
+                "category_best": None,
+                "category_worst": None,
+                "percentile": None,
+                "verdict": "at_avg",
+            })
+            continue
+
+        category_avg = round(sum(all_values) / len(all_values), 1)
+
+        if higher_is_better:
+            category_best = max(all_values)
+            category_worst = min(all_values)
+            vendors_below = sum(1 for v in all_values if v < vendor_value)
+        else:
+            # For "lower is better" metrics, best = lowest, worst = highest
+            category_best = min(all_values)
+            category_worst = max(all_values)
+            # Percentile: how many have MORE (worse) critical fails
+            vendors_below = sum(1 for v in all_values if v > vendor_value)
+
+        total_compared = len(all_values)
+        percentile = round((vendors_below / total_compared) * 100, 1) if total_compared > 0 else 0.0
+
+        # Determine verdict
+        if abs(vendor_value - category_avg) < 0.01:
+            verdict = "at_avg"
+        elif (higher_is_better and vendor_value > category_avg) or (not higher_is_better and vendor_value < category_avg):
+            verdict = "above_avg"
+        else:
+            verdict = "below_avg"
+
+        percentile_values.append(percentile)
+
+        metrics.append({
+            "metric_name": metric_name,
+            "vendor_value": vendor_value,
+            "category_avg": category_avg,
+            "category_best": category_best,
+            "category_worst": category_worst,
+            "percentile": percentile,
+            "verdict": verdict,
+        })
+
+    # Overall percentile: average of all individual percentiles
+    overall_percentile = round(sum(percentile_values) / len(percentile_values), 1) if percentile_values else None
+
+    # Rank by overall_score (1 = best)
+    score_values = [
+        (vid, vendor_data[vid]["overall_score"])
+        for vid in category_vendor_ids
+        if vendor_data[vid]["overall_score"] is not None
+    ]
+    score_values.sort(key=lambda x: x[1], reverse=True)
+    rank = None
+    for i, (vid, _) in enumerate(score_values, 1):
+        if vid == vendor_id:
+            rank = i
+            break
+
+    return {
+        "vendor_id": vendor_id,
+        "vendor_name": vendor["name"],
+        "category": category,
+        "total_vendors_in_category": total_in_category,
+        "metrics": metrics,
+        "overall_percentile": overall_percentile,
+        "rank": rank,
+    }

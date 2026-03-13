@@ -387,3 +387,81 @@ class BulkAssessmentResponse(BaseModel):
     results: List[BulkAssessmentResult]
     avg_score: float
     risk_distribution: dict
+
+
+# ── v1.9.0: Vendor Scorecards ────────────────────────────────────────────────
+
+class VendorScorecard(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    category: Optional[str]
+    overall_score: Optional[float] = None
+    risk_level: Optional[str] = None
+    compliance_score: float = Field(0.0, ge=0, le=100, description="Compliance coverage score 0-100")
+    contract_health_score: float = Field(0.0, ge=0, le=100, description="Contract renewal health 0-100")
+    data_completeness: float = Field(0.0, ge=0, le=100, description="Percentage of vendor data fields filled")
+    last_assessment_at: Optional[str] = None
+    assessment_count: int = 0
+    active_contracts: int = 0
+    compliance_certifications: int = 0
+    open_dependencies: int = 0
+    contacts_count: int = 0
+    tags: List[str] = []
+    strengths: List[str] = []
+    weaknesses: List[str] = []
+    recommendation_summary: Optional[str] = None
+
+
+# ── v1.9.0: Assessment Templates ─────────────────────────────────────────────
+
+class AssessmentTemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=1000)
+    answers: ChecklistAnswers
+    category: Optional[str] = Field(None, description="Template category for filtering")
+    tags: Optional[List[str]] = Field(None, description="Tags for organizing templates")
+
+
+class AssessmentTemplateUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = Field(None, max_length=1000)
+    answers: Optional[ChecklistAnswers] = None
+    category: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+
+class AssessmentTemplateResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    answers: ChecklistAnswers
+    category: Optional[str]
+    tags: List[str] = []
+    times_used: int = 0
+    created_at: str
+
+
+class ApplyTemplateRequest(BaseModel):
+    vendor_id: int
+
+
+# ── v1.9.0: Vendor Benchmarking ──────────────────────────────────────────────
+
+class BenchmarkMetric(BaseModel):
+    metric_name: str
+    vendor_value: Optional[float] = None
+    category_avg: Optional[float] = None
+    category_best: Optional[float] = None
+    category_worst: Optional[float] = None
+    percentile: Optional[float] = None
+    verdict: str = Field("at_avg", description="above_avg | at_avg | below_avg")
+
+
+class VendorBenchmark(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    category: Optional[str]
+    total_vendors_in_category: int = 0
+    metrics: List[BenchmarkMetric] = []
+    overall_percentile: Optional[float] = None
+    rank: Optional[int] = None

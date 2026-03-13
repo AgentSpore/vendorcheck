@@ -147,6 +147,24 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_deps_target ON vendor_dependencies(depends_on_id)"
         )
 
+        # -- v1.8.0: vendor contacts table --
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS vendor_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                email TEXT,
+                role TEXT,
+                phone TEXT,
+                is_primary INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE CASCADE
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contacts_vendor ON vendor_contacts(vendor_id)"
+        )
+
         # migrate: add category and next_review_date columns if missing
         cols = await db.execute("PRAGMA table_info(vendors)")
         col_names = {r[1] for r in await cols.fetchall()}
@@ -314,6 +332,7 @@ async def delete_vendor(db, vendor_id: int) -> bool:
     await db.execute("DELETE FROM vendor_notes WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM vendor_contracts WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM vendor_dependencies WHERE vendor_id=? OR depends_on_id=?", (vendor_id, vendor_id))
+    await db.execute("DELETE FROM vendor_contacts WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM vendors WHERE id=?", (vendor_id,))
     await db.commit()
     return True
@@ -1246,3 +1265,160 @@ async def diff_evaluations(db, eval_a_id: int, eval_b_id: int) -> dict | None:
         "new_recommendations": sorted(rec_b - rec_a),
         "resolved_recommendations": sorted(rec_a - rec_b),
     }
+
+
+# ── v1.8.0: Vendor Contacts ─────────────────────────────────────────────────
+
+async def create_contact(db, vendor_id: int, data: dict) -> dict:
+    now = datetime.utcnow().isoformat()
+    is_primary = int(data.get("is_primary", False))
+    if is_primary:
+        await db.execute(
+            "UPDATE vendor_contacts SET is_primary = 0 WHERE vendor_id = ?",
+            (vendor_id,),
+        )
+    cur = await db.execute(
+        """INSERT INTO vendor_contacts (vendor_id, name, email, role, phone, is_primary, created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (vendor_id, data["name"], data.get("email"), data.get("role"),
+         data.get("phone"), is_primary, now),
+    )
+    await db.commit()
+    return _contact_row(await _fetch_contact(db, cur.lastrowid))
+
+
+async def _fetch_contact(db, contact_id: int):
+    cur = await db.execute("SELECT * FROM vendor_contacts WHERE id=?", (contact_id,))
+    return await cur.fetchone()
+
+
+def _contact_row(r) -> dict:
+    if not r:
+        return {}
+    return {
+        "id": r[0], "vendor_id": r[1], "name": r[2], "email": r[3],
+        "role": r[4], "phone": r[5], "is_primary": bool(r[6]), "created_at": r[7],
+    }
+
+
+async def list_contacts(db, vendor_id: int) -> list[dict]:
+    cur = await db.execute(
+        "SELECT * FROM vendor_contacts WHERE vendor_id=? ORDER BY is_primary DESC, name ASC",
+        (vendor_id,),
+    )
+    rows = await cur.fetchall()
+    return [_contact_row(r) for r in rows]
+
+
+async def update_contact(db, contact_id: int, updates: dict) -> dict | None:
+    allowed = {"name", "email", "role", "phone", "is_primary"}
+    fields = {k: v for k, v in updates.items() if k in allowed and v is not None}
+    if not fields:
+        r = await _fetch_contact(db, contact_id)
+        return _contact_row(r) if r else None
+
+    if fields.get("is_primary"):
+        r = await _fetch_contact(db, contact_id)
+        if r:
+            await db.execute(
+                "UPDATE vendor_contacts SET is_primary = 0 WHERE vendor_id = ?",
+                (r[1],),
+            )
+        fields["is_primary"] = int(fields["is_primary"])
+    elif "is_primary" in fields:
+        fields["is_primary"] = int(fields["is_primary"])
+
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [contact_id]
+    cur = await db.execute(f"UPDATE vendor_contacts SET {set_clause} WHERE id=?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    r = await _fetch_contact(db, contact_id)
+    return _contact_row(r)
+
+
+async def delete_contact(db, contact_id: int) -> bool:
+    cur = await db.execute("DELETE FROM vendor_contacts WHERE id=?", (contact_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+# ── v1.8.0: Bulk Assessment ──────────────────────────────────────────────────
+
+async def bulk_assess(db, items: list[dict]) -> dict:
+    results = []
+    skipped = 0
+    for item in items:
+        vendor = await get_vendor(db, item["vendor_id"])
+        if not vendor:
+            skipped += 1
+            continue
+        assessment = await assess_vendor(db, item["vendor_id"], item["answers"])
+        results.append({
+            "vendor_id": item["vendor_id"],
+            "vendor_name": assessment["vendor_name"],
+            "total_score": assessment["total_score"],
+            "risk_level": assessment["risk_level"],
+            "critical_fails": assessment["critical_fails"],
+        })
+
+    scores = [r["total_score"] for r in results]
+    avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+    risk_dist = dict(Counter(r["risk_level"] for r in results))
+
+    return {
+        "assessed": len(results),
+        "skipped": skipped,
+        "results": results,
+        "avg_score": avg_score,
+        "risk_distribution": risk_dist,
+    }
+
+
+# ── v1.8.0: Portfolio CSV Export ─────────────────────────────────────────────
+
+async def export_portfolio_csv(db) -> str:
+    import csv, io
+    vendors = await list_vendors(db)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "vendor_id", "name", "category", "tags", "vendor_url", "use_case",
+        "next_review_date", "latest_score", "risk_level",
+        "compliance_frameworks", "compliance_statuses",
+        "total_contract_value", "contract_currencies",
+        "contacts_count", "primary_contact_name", "primary_contact_email",
+    ])
+
+    for v in vendors:
+        # Latest evaluation
+        eval_info = await _get_latest_eval(db, v["id"])
+        score = eval_info["score"] if eval_info else ""
+        risk = eval_info["risk_level"] if eval_info else ""
+
+        # Compliance
+        compliance = await list_compliance(db, v["id"])
+        fw_list = "|".join(c["framework"] for c in compliance)
+        status_list = "|".join(f"{c['framework']}:{c['status']}" for c in compliance)
+
+        # Contracts
+        contracts = await list_contracts(db, v["id"])
+        total_value = sum(c["contract_value"] for c in contracts)
+        currencies = "|".join(sorted(set(c["currency"] for c in contracts))) if contracts else ""
+
+        # Contacts
+        contacts = await list_contacts(db, v["id"])
+        primary = next((c for c in contacts if c["is_primary"]), contacts[0] if contacts else None)
+        primary_name = primary["name"] if primary else ""
+        primary_email = primary["email"] if primary else ""
+
+        writer.writerow([
+            v["id"], v["name"], v.get("category", ""), "|".join(v.get("tags", [])),
+            v.get("vendor_url", ""), v.get("use_case", ""),
+            v.get("next_review_date", ""), score, risk,
+            fw_list, status_list,
+            total_value if contracts else "", currencies,
+            len(contacts), primary_name, primary_email,
+        ])
+    return buf.getvalue()

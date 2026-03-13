@@ -7,6 +7,7 @@ class VendorCreate(BaseModel):
     name: str
     vendor_url: Optional[str] = None
     use_case: Optional[str] = None
+    category: Optional[str] = Field(None, description="Category: ai_ml | cloud | security | analytics | communication | database | devops | fintech | hr_tech | other")
 
 
 class VendorResponse(BaseModel):
@@ -14,7 +15,9 @@ class VendorResponse(BaseModel):
     name: str
     vendor_url: Optional[str] = None
     use_case: Optional[str] = None
+    category: Optional[str] = None
     tags: List[str] = []
+    next_review_date: Optional[str] = None
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -24,6 +27,8 @@ class VendorUpdate(BaseModel):
     name: Optional[str] = None
     vendor_url: Optional[str] = None
     use_case: Optional[str] = None
+    category: Optional[str] = None
+    next_review_date: Optional[str] = Field(None, description="ISO date for next review (YYYY-MM-DD)")
 
 
 class ChecklistAnswers(BaseModel):
@@ -191,3 +196,44 @@ class RiskAlertsResponse(BaseModel):
     alerts: List[RiskAlert]
     trend: str
     evaluations_checked: int
+
+
+# ── Contracts ─────────────────────────────────────────────────────────────────
+
+class ContractCreate(BaseModel):
+    contract_value: float = Field(..., gt=0, description="Contract value in specified currency")
+    currency: str = Field("USD", max_length=3, description="ISO 4217 currency code")
+    renewal_date: str = Field(..., description="Next renewal date (YYYY-MM-DD)")
+    auto_renew: bool = Field(False, description="Whether contract auto-renews")
+    contract_type: str = Field("subscription", description="subscription | perpetual | usage_based | enterprise")
+    notes: Optional[str] = Field(None, max_length=1000)
+
+
+class ContractResponse(BaseModel):
+    id: int
+    vendor_id: int
+    contract_value: float
+    currency: str
+    renewal_date: str
+    auto_renew: bool
+    contract_type: str
+    notes: Optional[str]
+    created_at: str
+
+
+class ContractUpdate(BaseModel):
+    contract_value: Optional[float] = Field(None, gt=0)
+    currency: Optional[str] = Field(None, max_length=3)
+    renewal_date: Optional[str] = None
+    auto_renew: Optional[bool] = None
+    contract_type: Optional[str] = None
+    notes: Optional[str] = None
+
+
+# ── Category Stats ────────────────────────────────────────────────────────────
+
+class CategoryStats(BaseModel):
+    category: str
+    vendor_count: int
+    avg_score: Optional[float]
+    risk_distribution: dict

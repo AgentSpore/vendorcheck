@@ -8,6 +8,8 @@ from models import (
     ComplianceCreate, ComplianceResponse,
     NoteCreate, NoteResponse,
     RiskAlertsResponse,
+    ContractCreate, ContractResponse, ContractUpdate,
+    CategoryStats,
 )
 from engine import (
     init_db, create_vendor, list_vendors, get_vendor,
@@ -19,6 +21,9 @@ from engine import (
     get_portfolio_risk,
     add_compliance, list_compliance, remove_compliance, VALID_FRAMEWORKS, VALID_COMPLIANCE_STATUS,
     add_note, list_notes, get_risk_alerts,
+    get_vendors_due_for_review, VALID_CATEGORIES,
+    create_contract, list_contracts, get_contract, update_contract, delete_contract,
+    get_expiring_contracts, get_category_stats,
 )
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -34,8 +39,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="VendorCheck",
-    description="AI vendor risk assessment: checklist scoring, compliance tracking, notes audit trail, risk alerts, portfolio dashboard.",
-    version="1.5.0",
+    description=(
+        "AI vendor risk assessment: checklist scoring, compliance tracking, "
+        "notes audit trail, risk alerts, portfolio dashboard, vendor categories, "
+        "review scheduling, contract tracking with renewal alerts."
+    ),
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -50,7 +59,10 @@ async def get_db():
 
 @app.post("/vendors", response_model=VendorResponse, status_code=201)
 async def add_vendor(body: VendorCreate, db=Depends(get_db)):
-    return await create_vendor(db, body.name, body.vendor_url, body.use_case)
+    try:
+        return await create_vendor(db, body.name, body.vendor_url, body.use_case, body.category)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
 
 
 @app.get("/vendors/compare")
@@ -67,9 +79,32 @@ async def compare_vendors_endpoint(
     return await compare_vendors(db, vendor_ids)
 
 
+@app.get("/vendors/due-for-review")
+async def vendors_due_for_review(
+    as_of: Optional[str] = Query(None, description="Check date (YYYY-MM-DD, default: today)"),
+    db=Depends(get_db),
+):
+    """List vendors whose next_review_date has passed or is today."""
+    return await get_vendors_due_for_review(db, as_of)
+
+
+@app.get("/vendors/expiring-contracts")
+async def expiring_contracts(
+    within_days: int = Query(30, ge=1, le=365, description="Days ahead to check"),
+    db=Depends(get_db),
+):
+    """List contracts expiring within N days across all vendors."""
+    return await get_expiring_contracts(db, within_days)
+
+
 @app.get("/vendors", response_model=List[VendorResponse])
-async def get_vendors(db=Depends(get_db)):
-    return await list_vendors(db)
+async def get_vendors(
+    category: Optional[str] = Query(None, description="Filter by category"),
+    db=Depends(get_db),
+):
+    if category and category not in VALID_CATEGORIES:
+        raise HTTPException(422, f"Invalid category. Valid: {', '.join(sorted(VALID_CATEGORIES))}")
+    return await list_vendors(db, category)
 
 
 @app.get("/vendors/{vendor_id}", response_model=VendorResponse)
@@ -85,7 +120,10 @@ async def patch_vendor(vendor_id: int, body: VendorUpdate, db=Depends(get_db)):
     updates = body.model_dump(exclude_none=True)
     if not updates:
         raise HTTPException(400, "No fields to update")
-    v = await update_vendor(db, vendor_id, updates)
+    try:
+        v = await update_vendor(db, vendor_id, updates)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
     if not v:
         raise HTTPException(404, "Vendor not found")
     return v
@@ -119,7 +157,6 @@ async def vendor_history_endpoint(vendor_id: int, db=Depends(get_db)):
 
 @app.post("/vendors/{vendor_id}/compliance", response_model=ComplianceResponse, status_code=201)
 async def add_vendor_compliance(vendor_id: int, body: ComplianceCreate, db=Depends(get_db)):
-    """Track vendor compliance certifications (GDPR, SOC2, HIPAA, ISO27001, PCI-DSS, CCPA, FedRAMP)."""
     v = await get_vendor(db, vendor_id)
     if not v:
         raise HTTPException(404, "Vendor not found")
@@ -148,7 +185,6 @@ async def remove_vendor_compliance(vendor_id: int, framework: str, db=Depends(ge
 
 @app.post("/vendors/{vendor_id}/notes", response_model=NoteResponse, status_code=201)
 async def add_vendor_note(vendor_id: int, body: NoteCreate, db=Depends(get_db)):
-    """Append a timestamped note to vendor for audit trail."""
     v = await get_vendor(db, vendor_id)
     if not v:
         raise HTTPException(404, "Vendor not found")
@@ -168,14 +204,55 @@ async def get_vendor_notes(vendor_id: int, db=Depends(get_db)):
 @app.get("/vendors/{vendor_id}/risk-alerts", response_model=RiskAlertsResponse)
 async def vendor_risk_alerts(
     vendor_id: int,
-    lookback: int = Query(5, ge=2, le=20, description="Number of recent assessments to analyze"),
+    lookback: int = Query(5, ge=2, le=20),
     db=Depends(get_db),
 ):
-    """Detect risk degradation: score drops, risk escalation, declining trends, expired compliance."""
     result = await get_risk_alerts(db, vendor_id, lookback)
     if result is None:
         raise HTTPException(404, "Vendor not found")
     return result
+
+
+# ── Contracts ─────────────────────────────────────────────────────────────────
+
+@app.post("/vendors/{vendor_id}/contracts", response_model=ContractResponse, status_code=201)
+async def add_contract(vendor_id: int, body: ContractCreate, db=Depends(get_db)):
+    """Track vendor contract details (value, renewal date, auto-renew, type)."""
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    try:
+        return await create_contract(db, vendor_id, body.model_dump())
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/vendors/{vendor_id}/contracts", response_model=List[ContractResponse])
+async def get_contracts(vendor_id: int, db=Depends(get_db)):
+    v = await get_vendor(db, vendor_id)
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    return await list_contracts(db, vendor_id)
+
+
+@app.patch("/contracts/{contract_id}", response_model=ContractResponse)
+async def patch_contract(contract_id: int, body: ContractUpdate, db=Depends(get_db)):
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+    try:
+        c = await update_contract(db, contract_id, updates)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    if not c:
+        raise HTTPException(404, "Contract not found")
+    return c
+
+
+@app.delete("/contracts/{contract_id}", status_code=204)
+async def remove_contract(contract_id: int, db=Depends(get_db)):
+    if not await delete_contract(db, contract_id):
+        raise HTTPException(404, "Contract not found")
 
 
 # ── Tags ──────────────────────────────────────────────────────────────────────
@@ -217,8 +294,15 @@ async def vendors_by_tag(tag: str, db=Depends(get_db)):
 
 @app.get("/portfolio/risk", response_model=PortfolioRisk)
 async def portfolio_risk(db=Depends(get_db)):
-    """Aggregate risk dashboard across all vendors."""
     return await get_portfolio_risk(db)
+
+
+# ── Category Stats ────────────────────────────────────────────────────────────
+
+@app.get("/categories/stats", response_model=List[CategoryStats])
+async def category_stats(db=Depends(get_db)):
+    """Per-category analytics: vendor count, average score, risk distribution."""
+    return await get_category_stats(db)
 
 
 # ── Evaluations ───────────────────────────────────────────────────────────────
@@ -260,4 +344,4 @@ async def remove_evaluation(eval_id: int, db=Depends(get_db)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.5.0"}
+    return {"status": "ok", "version": "1.6.0"}

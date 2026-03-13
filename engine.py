@@ -1,6 +1,7 @@
 import aiosqlite
 import json
 from datetime import datetime
+from collections import Counter
 
 DB_PATH = "vendorcheck.db"
 
@@ -53,8 +54,26 @@ async def init_db():
                 FOREIGN KEY (vendor_id) REFERENCES vendors(id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS vendor_tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_id INTEGER NOT NULL,
+                tag TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE CASCADE,
+                UNIQUE(vendor_id, tag)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tags_vendor ON vendor_tags(vendor_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tags_tag ON vendor_tags(tag)"
+        )
         await db.commit()
 
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
 
 def _score(answers: dict) -> dict:
     passed = 0
@@ -129,6 +148,8 @@ def _score(answers: dict) -> dict:
     }
 
 
+# ── Vendors CRUD ──────────────────────────────────────────────────────────────
+
 async def create_vendor(db, name: str, vendor_url, use_case) -> dict:
     now = datetime.utcnow().isoformat()
     cur = await db.execute(
@@ -136,7 +157,10 @@ async def create_vendor(db, name: str, vendor_url, use_case) -> dict:
         (name, vendor_url, use_case, now),
     )
     await db.commit()
-    return {"id": cur.lastrowid, "name": name, "vendor_url": vendor_url, "use_case": use_case, "created_at": now}
+    return {
+        "id": cur.lastrowid, "name": name, "vendor_url": vendor_url,
+        "use_case": use_case, "tags": [], "created_at": now,
+    }
 
 
 async def update_vendor(db, vendor_id: int, updates: dict) -> dict | None:
@@ -154,25 +178,131 @@ async def update_vendor(db, vendor_id: int, updates: dict) -> dict | None:
 
 
 async def list_vendors(db) -> list:
-    cur = await db.execute("SELECT id, name, vendor_url, use_case, created_at FROM vendors ORDER BY id DESC")
+    cur = await db.execute(
+        "SELECT id, name, vendor_url, use_case, created_at FROM vendors ORDER BY id DESC"
+    )
     rows = await cur.fetchall()
-    return [{"id": r[0], "name": r[1], "vendor_url": r[2], "use_case": r[3], "created_at": r[4]} for r in rows]
+    result = []
+    for r in rows:
+        tags = await _get_tags(db, r[0])
+        result.append({
+            "id": r[0], "name": r[1], "vendor_url": r[2],
+            "use_case": r[3], "tags": tags, "created_at": r[4],
+        })
+    return result
 
 
 async def get_vendor(db, vendor_id: int):
-    cur = await db.execute("SELECT id, name, vendor_url, use_case, created_at FROM vendors WHERE id=?", (vendor_id,))
+    cur = await db.execute(
+        "SELECT id, name, vendor_url, use_case, created_at FROM vendors WHERE id=?",
+        (vendor_id,),
+    )
     r = await cur.fetchone()
-    return {"id": r[0], "name": r[1], "vendor_url": r[2], "use_case": r[3], "created_at": r[4]} if r else None
+    if not r:
+        return None
+    tags = await _get_tags(db, r[0])
+    return {
+        "id": r[0], "name": r[1], "vendor_url": r[2],
+        "use_case": r[3], "tags": tags, "created_at": r[4],
+    }
 
 
 async def delete_vendor(db, vendor_id: int) -> bool:
     vendor = await get_vendor(db, vendor_id)
     if not vendor:
         return False
+    await db.execute("DELETE FROM vendor_tags WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM evaluations WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM vendors WHERE id=?", (vendor_id,))
     await db.commit()
     return True
+
+
+# ── Tags ──────────────────────────────────────────────────────────────────────
+
+async def _get_tags(db, vendor_id: int) -> list[str]:
+    cur = await db.execute(
+        "SELECT tag FROM vendor_tags WHERE vendor_id=? ORDER BY tag", (vendor_id,)
+    )
+    return [r[0] for r in await cur.fetchall()]
+
+
+async def add_tag(db, vendor_id: int, tag: str) -> list[str]:
+    now = datetime.utcnow().isoformat()
+    try:
+        await db.execute(
+            "INSERT INTO vendor_tags (vendor_id, tag, created_at) VALUES (?,?,?)",
+            (vendor_id, tag, now),
+        )
+        await db.commit()
+    except Exception:
+        pass  # UNIQUE constraint — tag already exists, that's fine
+    return await _get_tags(db, vendor_id)
+
+
+async def remove_tag(db, vendor_id: int, tag: str) -> bool:
+    cur = await db.execute(
+        "DELETE FROM vendor_tags WHERE vendor_id=? AND tag=?", (vendor_id, tag)
+    )
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def list_all_tags(db) -> list[dict]:
+    cur = await db.execute(
+        """SELECT tag, COUNT(DISTINCT vendor_id) AS cnt
+           FROM vendor_tags GROUP BY tag ORDER BY cnt DESC"""
+    )
+    return [{"tag": r[0], "vendor_count": r[1]} for r in await cur.fetchall()]
+
+
+async def list_vendors_by_tag(db, tag: str) -> list[dict]:
+    cur = await db.execute(
+        """SELECT v.id, v.name, v.vendor_url, v.use_case, v.created_at
+           FROM vendors v
+           JOIN vendor_tags t ON t.vendor_id = v.id
+           WHERE t.tag = ?
+           ORDER BY v.name""",
+        (tag,),
+    )
+    rows = await cur.fetchall()
+    result = []
+    for r in rows:
+        tags = await _get_tags(db, r[0])
+        result.append({
+            "id": r[0], "name": r[1], "vendor_url": r[2],
+            "use_case": r[3], "tags": tags, "created_at": r[4],
+        })
+    return result
+
+
+# ── Assessments ───────────────────────────────────────────────────────────────
+
+async def assess_vendor(db, vendor_id: int, answers: dict) -> dict:
+    result = _score(answers)
+    now = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        """INSERT INTO evaluations
+           (vendor_id, answers, total_score, risk_level, passed, failed,
+            critical_fails, recommendations, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (
+            vendor_id, json.dumps(answers), result["total_score"],
+            result["risk_level"], result["passed"], result["failed"],
+            json.dumps(result["critical_fails"]),
+            json.dumps(result["recommendations"]), now,
+        ),
+    )
+    await db.commit()
+    vendor = await get_vendor(db, vendor_id)
+    return {
+        "id": cur.lastrowid, "vendor_id": vendor_id,
+        "vendor_name": vendor["name"] if vendor else "unknown",
+        "total_score": result["total_score"], "risk_level": result["risk_level"],
+        "passed": result["passed"], "failed": result["failed"],
+        "critical_fails": result["critical_fails"],
+        "recommendations": result["recommendations"], "created_at": now,
+    }
 
 
 async def compare_vendors(db, vendor_ids: list[int]) -> list[dict]:
@@ -190,69 +320,27 @@ async def compare_vendors(db, vendor_ids: list[int]) -> list[dict]:
         row = await cur.fetchone()
         if row:
             result.append({
-                "vendor_id": vid,
-                "vendor_name": vendor["name"],
-                "vendor_url": vendor["vendor_url"],
-                "use_case": vendor["use_case"],
-                "latest_score": row[1],
-                "risk_level": row[2],
-                "passed": row[3],
-                "failed": row[4],
+                "vendor_id": vid, "vendor_name": vendor["name"],
+                "vendor_url": vendor["vendor_url"], "use_case": vendor["use_case"],
+                "tags": vendor["tags"],
+                "latest_score": row[1], "risk_level": row[2],
+                "passed": row[3], "failed": row[4],
                 "critical_fails": json.loads(row[5]),
                 "top_recommendations": json.loads(row[6])[:3],
                 "evaluated_at": row[7],
             })
         else:
             result.append({
-                "vendor_id": vid,
-                "vendor_name": vendor["name"],
-                "vendor_url": vendor["vendor_url"],
-                "use_case": vendor["use_case"],
-                "latest_score": None,
-                "risk_level": None,
-                "passed": None,
-                "failed": None,
-                "critical_fails": [],
-                "top_recommendations": [],
+                "vendor_id": vid, "vendor_name": vendor["name"],
+                "vendor_url": vendor["vendor_url"], "use_case": vendor["use_case"],
+                "tags": vendor["tags"],
+                "latest_score": None, "risk_level": None,
+                "passed": None, "failed": None,
+                "critical_fails": [], "top_recommendations": [],
                 "evaluated_at": None,
             })
     result.sort(key=lambda x: (x["latest_score"] or -1), reverse=True)
     return result
-
-
-async def assess_vendor(db, vendor_id: int, answers: dict) -> dict:
-    result = _score(answers)
-    now = datetime.utcnow().isoformat()
-    cur = await db.execute(
-        """INSERT INTO evaluations
-           (vendor_id, answers, total_score, risk_level, passed, failed, critical_fails, recommendations, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
-        (
-            vendor_id,
-            json.dumps(answers),
-            result["total_score"],
-            result["risk_level"],
-            result["passed"],
-            result["failed"],
-            json.dumps(result["critical_fails"]),
-            json.dumps(result["recommendations"]),
-            now,
-        ),
-    )
-    await db.commit()
-    vendor = await get_vendor(db, vendor_id)
-    return {
-        "id": cur.lastrowid,
-        "vendor_id": vendor_id,
-        "vendor_name": vendor["name"] if vendor else "unknown",
-        "total_score": result["total_score"],
-        "risk_level": result["risk_level"],
-        "passed": result["passed"],
-        "failed": result["failed"],
-        "critical_fails": result["critical_fails"],
-        "recommendations": result["recommendations"],
-        "created_at": now,
-    }
 
 
 async def get_vendor_history(db, vendor_id: int) -> dict | None:
@@ -260,8 +348,7 @@ async def get_vendor_history(db, vendor_id: int) -> dict | None:
     if not vendor:
         return None
     cur = await db.execute(
-        """SELECT id, total_score, risk_level, created_at
-           FROM evaluations WHERE vendor_id=? ORDER BY id ASC""",
+        "SELECT id, total_score, risk_level, created_at FROM evaluations WHERE vendor_id=? ORDER BY id ASC",
         (vendor_id,),
     )
     rows = await cur.fetchall()
@@ -270,11 +357,8 @@ async def get_vendor_history(db, vendor_id: int) -> dict | None:
     for r in rows:
         delta = (r[1] - prev_score) if prev_score is not None else None
         points.append({
-            "eval_id": r[0],
-            "total_score": r[1],
-            "risk_level": r[2],
-            "delta": delta,
-            "created_at": r[3],
+            "eval_id": r[0], "total_score": r[1],
+            "risk_level": r[2], "delta": delta, "created_at": r[3],
         })
         prev_score = r[1]
 
@@ -285,15 +369,15 @@ async def get_vendor_history(db, vendor_id: int) -> dict | None:
         trend = "insufficient_data"
 
     return {
-        "vendor_id": vendor_id,
-        "vendor_name": vendor["name"],
-        "evaluations": points,
-        "trend": trend,
+        "vendor_id": vendor_id, "vendor_name": vendor["name"],
+        "evaluations": points, "trend": trend,
         "latest_score": scores[-1] if scores else None,
         "best_score": max(scores) if scores else None,
         "worst_score": min(scores) if scores else None,
     }
 
+
+# ── Evaluations CRUD ─────────────────────────────────────────────────────────
 
 async def delete_evaluation(db, eval_id: int) -> bool:
     cur = await db.execute("DELETE FROM evaluations WHERE id=?", (eval_id,))
@@ -301,19 +385,21 @@ async def delete_evaluation(db, eval_id: int) -> bool:
     return cur.rowcount > 0
 
 
-async def evaluate_vendor(db, vendor_id: int, answers: dict) -> dict:
-    return await assess_vendor(db, vendor_id, answers)
-
-
 async def list_evaluations(db, vendor_id=None) -> list:
     if vendor_id:
         cur = await db.execute(
-            "SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level, e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id WHERE e.vendor_id=? ORDER BY e.id DESC",
+            """SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level,
+                      e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at
+               FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id
+               WHERE e.vendor_id=? ORDER BY e.id DESC""",
             (vendor_id,),
         )
     else:
         cur = await db.execute(
-            "SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level, e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id ORDER BY e.id DESC"
+            """SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level,
+                      e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at
+               FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id
+               ORDER BY e.id DESC"""
         )
     rows = await cur.fetchall()
     return [
@@ -321,8 +407,8 @@ async def list_evaluations(db, vendor_id=None) -> list:
             "id": r[0], "vendor_id": r[1], "vendor_name": r[2] or "unknown",
             "total_score": r[3], "risk_level": r[4],
             "passed": r[5], "failed": r[6],
-            "critical_fails": json.loads(r[7]), "recommendations": json.loads(r[8]),
-            "created_at": r[9],
+            "critical_fails": json.loads(r[7]),
+            "recommendations": json.loads(r[8]), "created_at": r[9],
         }
         for r in rows
     ]
@@ -330,7 +416,9 @@ async def list_evaluations(db, vendor_id=None) -> list:
 
 async def get_evaluation(db, eval_id: int):
     cur = await db.execute(
-        "SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level, e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id WHERE e.id=?",
+        """SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level,
+                  e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at
+           FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id WHERE e.id=?""",
         (eval_id,),
     )
     r = await cur.fetchone()
@@ -340,13 +428,12 @@ async def get_evaluation(db, eval_id: int):
         "id": r[0], "vendor_id": r[1], "vendor_name": r[2] or "unknown",
         "total_score": r[3], "risk_level": r[4],
         "passed": r[5], "failed": r[6],
-        "critical_fails": json.loads(r[7]), "recommendations": json.loads(r[8]),
-        "created_at": r[9],
+        "critical_fails": json.loads(r[7]),
+        "recommendations": json.loads(r[8]), "created_at": r[9],
     }
 
 
 async def get_evaluation_stats(db) -> dict:
-    from collections import Counter
     evals = await list_evaluations(db)
     if not evals:
         return {
@@ -360,17 +447,13 @@ async def get_evaluation_stats(db) -> dict:
     top_critical = [{"check": k, "count": v} for k, v in Counter(all_critical).most_common(5)]
     top_recs = [{"recommendation": k, "count": v} for k, v in Counter(all_recs).most_common(5)]
     return {
-        "total": len(evals),
-        "by_risk": by_risk,
-        "avg_score": avg_score,
-        "top_critical_fails": top_critical,
-        "top_recommendations": top_recs,
+        "total": len(evals), "by_risk": by_risk, "avg_score": avg_score,
+        "top_critical_fails": top_critical, "top_recommendations": top_recs,
     }
 
 
 async def export_evaluations_csv(db) -> str:
-    import csv
-    import io
+    import csv, io
     evals = await list_evaluations(db)
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -380,10 +463,89 @@ async def export_evaluations_csv(db) -> str:
     ])
     for e in evals:
         writer.writerow([
-            e["id"], e["vendor_id"], e["vendor_name"], e["total_score"], e["risk_level"],
-            e["passed"], e["failed"],
-            "|".join(e["critical_fails"]),
-            "|".join(e["recommendations"]),
+            e["id"], e["vendor_id"], e["vendor_name"], e["total_score"],
+            e["risk_level"], e["passed"], e["failed"],
+            "|".join(e["critical_fails"]), "|".join(e["recommendations"]),
             e["created_at"],
         ])
     return buf.getvalue()
+
+
+# ── Portfolio Risk ────────────────────────────────────────────────────────────
+
+async def get_portfolio_risk(db) -> dict:
+    vendors = await list_vendors(db)
+    total_vendors = len(vendors)
+
+    # Get latest evaluation per vendor
+    cur = await db.execute(
+        """SELECT e.vendor_id, e.total_score, e.risk_level, e.critical_fails,
+                  v.name
+           FROM evaluations e
+           JOIN vendors v ON v.id = e.vendor_id
+           WHERE e.id IN (
+               SELECT MAX(id) FROM evaluations GROUP BY vendor_id
+           )
+           ORDER BY e.total_score ASC"""
+    )
+    latest = await cur.fetchall()
+
+    evaluated = len(latest)
+    scores = [r[1] for r in latest]
+    avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
+
+    # Risk distribution
+    risk_counts = Counter(r[2] for r in latest)
+    distribution = []
+    for level in ["critical", "high", "medium", "low"]:
+        cnt = risk_counts.get(level, 0)
+        distribution.append({
+            "level": level,
+            "count": cnt,
+            "pct": round(cnt / evaluated * 100, 1) if evaluated else 0,
+        })
+
+    # Overall risk level
+    if risk_counts.get("critical", 0) > 0:
+        overall = "critical"
+    elif avg_score >= 80:
+        overall = "low"
+    elif avg_score >= 60:
+        overall = "medium"
+    elif avg_score >= 40:
+        overall = "high"
+    else:
+        overall = "critical"
+
+    # Critical vendors (risk = critical or high)
+    critical_vendors = []
+    for r in latest:
+        if r[2] in ("critical", "high"):
+            critical_vendors.append({
+                "vendor_id": r[0], "vendor_name": r[4],
+                "score": r[1], "risk_level": r[2],
+                "top_fails": json.loads(r[3])[:3],
+            })
+
+    # Aggregate checks and recommendations
+    all_critical = []
+    all_recs = []
+    evals = await list_evaluations(db)
+    for e in evals:
+        all_critical.extend(e["critical_fails"])
+        all_recs.extend(e["recommendations"])
+
+    top_checks = [{"check": k, "count": v} for k, v in Counter(all_critical).most_common(5)]
+    top_recs = [{"recommendation": k, "count": v} for k, v in Counter(all_recs).most_common(5)]
+
+    return {
+        "total_vendors": total_vendors,
+        "evaluated_vendors": evaluated,
+        "unevaluated_vendors": total_vendors - evaluated,
+        "avg_score": avg_score,
+        "overall_risk_level": overall,
+        "risk_distribution": distribution,
+        "critical_vendors": critical_vendors,
+        "top_critical_checks": top_checks,
+        "top_recommendations": top_recs,
+    }

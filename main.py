@@ -15,6 +15,10 @@ from models import (
     EvalDiffResponse,
     ContactCreate, ContactResponse, ContactUpdate,
     BulkAssessmentRequest, BulkAssessmentResponse,
+    VendorScorecard,
+    AssessmentTemplateCreate, AssessmentTemplateUpdate,
+    AssessmentTemplateResponse, ApplyTemplateRequest,
+    VendorBenchmark,
 )
 from engine import (
     init_db, create_vendor, list_vendors, get_vendor,
@@ -34,6 +38,11 @@ from engine import (
     diff_evaluations,
     create_contact, list_contacts, update_contact, delete_contact,
     bulk_assess, export_portfolio_csv,
+    generate_scorecard,
+    create_assessment_template, list_assessment_templates,
+    get_assessment_template, update_assessment_template,
+    delete_assessment_template, apply_assessment_template,
+    get_vendor_benchmark,
 )
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -55,9 +64,10 @@ app = FastAPI(
         "review scheduling, contract tracking with renewal alerts, "
         "vendor dependency chains with cascade risk analysis, "
         "compliance calendar and cross-vendor matrix, assessment diff comparison, "
-        "vendor contacts management, bulk assessment, and portfolio CSV export."
+        "vendor contacts management, bulk assessment, portfolio CSV export, "
+        "vendor scorecards, assessment templates, and vendor benchmarking."
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -380,6 +390,100 @@ async def remove_contact(contact_id: int, db=Depends(get_db)):
         raise HTTPException(404, "Contact not found")
 
 
+# ── v1.9.0: Vendor Scorecards ───────────────────────────────────────────────
+
+@app.get("/vendors/{vendor_id}/scorecard", response_model=VendorScorecard)
+async def vendor_scorecard(vendor_id: int, db=Depends(get_db)):
+    """Generate a comprehensive scorecard combining all data sources for a vendor."""
+    result = await generate_scorecard(db, vendor_id)
+    if not result:
+        raise HTTPException(404, "Vendor not found")
+    return result
+
+
+# ── v1.9.0: Assessment Templates ────────────────────────────────────────────
+
+@app.post("/assessment-templates", response_model=AssessmentTemplateResponse, status_code=201)
+async def create_template(body: AssessmentTemplateCreate, db=Depends(get_db)):
+    """Create a reusable assessment template with pre-filled checklist answers."""
+    try:
+        return await create_assessment_template(db, {
+            "name": body.name,
+            "description": body.description,
+            "answers": body.answers.model_dump(),
+            "category": body.category,
+            "tags": body.tags,
+        })
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/assessment-templates", response_model=List[AssessmentTemplateResponse])
+async def get_templates(
+    category: Optional[str] = Query(None, description="Filter templates by category"),
+    db=Depends(get_db),
+):
+    """List all assessment templates, optionally filtered by category."""
+    return await list_assessment_templates(db, category)
+
+
+@app.get("/assessment-templates/{template_id}", response_model=AssessmentTemplateResponse)
+async def get_template(template_id: int, db=Depends(get_db)):
+    """Get a single assessment template by ID."""
+    result = await get_assessment_template(db, template_id)
+    if not result:
+        raise HTTPException(404, "Assessment template not found")
+    return result
+
+
+@app.patch("/assessment-templates/{template_id}", response_model=AssessmentTemplateResponse)
+async def patch_template(template_id: int, body: AssessmentTemplateUpdate, db=Depends(get_db)):
+    """Update an existing assessment template."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(400, "No fields to update")
+    # Convert answers model to dict if present
+    if "answers" in updates and hasattr(updates["answers"], "model_dump"):
+        updates["answers"] = updates["answers"].model_dump()
+    try:
+        result = await update_assessment_template(db, template_id, updates)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    if not result:
+        raise HTTPException(404, "Assessment template not found")
+    return result
+
+
+@app.delete("/assessment-templates/{template_id}", status_code=204)
+async def remove_template(template_id: int, db=Depends(get_db)):
+    """Delete an assessment template."""
+    if not await delete_assessment_template(db, template_id):
+        raise HTTPException(404, "Assessment template not found")
+
+
+@app.post("/assessment-templates/{template_id}/apply", response_model=AssessmentResponse, status_code=201)
+async def apply_template(template_id: int, body: ApplyTemplateRequest, db=Depends(get_db)):
+    """Apply an assessment template to a vendor. Runs the assessment and increments times_used."""
+    try:
+        return await apply_assessment_template(db, template_id, body.vendor_id)
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg.lower():
+            raise HTTPException(404, msg)
+        raise HTTPException(422, msg)
+
+
+# ── v1.9.0: Vendor Benchmarking ─────────────────────────────────────────────
+
+@app.get("/vendors/{vendor_id}/benchmark", response_model=VendorBenchmark)
+async def vendor_benchmark(vendor_id: int, db=Depends(get_db)):
+    """Compare vendor metrics against category averages and compute percentile ranking."""
+    result = await get_vendor_benchmark(db, vendor_id)
+    if not result:
+        raise HTTPException(404, "Vendor not found")
+    return result
+
+
 # ── Tags ──────────────────────────────────────────────────────────────────────
 
 @app.post("/vendors/{vendor_id}/tags", response_model=TagListResponse, status_code=201)
@@ -481,4 +585,4 @@ async def remove_evaluation(eval_id: int, db=Depends(get_db)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.8.0"}
+    return {"status": "ok", "version": "1.9.0"}

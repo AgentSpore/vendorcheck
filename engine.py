@@ -5,6 +5,13 @@ from collections import Counter
 
 DB_PATH = "vendorcheck.db"
 
+VALID_CATEGORIES = {
+    "ai_ml", "cloud", "security", "analytics", "communication",
+    "database", "devops", "fintech", "hr_tech", "other",
+}
+
+VALID_CONTRACT_TYPES = {"subscription", "perpetual", "usage_based", "enterprise"}
+
 CRITICAL_FIELDS = [
     "gdpr_compliant",
     "no_training_on_your_data",
@@ -36,6 +43,8 @@ async def init_db():
                 name TEXT NOT NULL,
                 vendor_url TEXT,
                 use_case TEXT,
+                category TEXT,
+                next_review_date TEXT,
                 created_at TEXT NOT NULL
             )
         """)
@@ -94,6 +103,35 @@ async def init_db():
                 FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE CASCADE
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS vendor_contracts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_id INTEGER NOT NULL,
+                contract_value REAL NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                renewal_date TEXT NOT NULL,
+                auto_renew INTEGER NOT NULL DEFAULT 0,
+                contract_type TEXT NOT NULL DEFAULT 'subscription',
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE CASCADE
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contracts_vendor ON vendor_contracts(vendor_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contracts_renewal ON vendor_contracts(renewal_date)"
+        )
+
+        # migrate: add category and next_review_date columns if missing
+        cols = await db.execute("PRAGMA table_info(vendors)")
+        col_names = {r[1] for r in await cols.fetchall()}
+        if "category" not in col_names:
+            await db.execute("ALTER TABLE vendors ADD COLUMN category TEXT")
+        if "next_review_date" not in col_names:
+            await db.execute("ALTER TABLE vendors ADD COLUMN next_review_date TEXT")
+
         await db.commit()
 
 
@@ -174,24 +212,30 @@ def _score(answers: dict) -> dict:
 
 # ── Vendors CRUD ──────────────────────────────────────────────────────────────
 
-async def create_vendor(db, name: str, vendor_url, use_case) -> dict:
+async def create_vendor(db, name: str, vendor_url, use_case, category=None) -> dict:
     now = datetime.utcnow().isoformat()
+    if category and category not in VALID_CATEGORIES:
+        raise ValueError(f"Invalid category. Valid: {', '.join(sorted(VALID_CATEGORIES))}")
     cur = await db.execute(
-        "INSERT INTO vendors (name, vendor_url, use_case, created_at) VALUES (?,?,?,?)",
-        (name, vendor_url, use_case, now),
+        "INSERT INTO vendors (name, vendor_url, use_case, category, created_at) VALUES (?,?,?,?,?)",
+        (name, vendor_url, use_case, category, now),
     )
     await db.commit()
     return {
         "id": cur.lastrowid, "name": name, "vendor_url": vendor_url,
-        "use_case": use_case, "tags": [], "created_at": now,
+        "use_case": use_case, "category": category, "tags": [],
+        "next_review_date": None, "created_at": now,
     }
 
 
 async def update_vendor(db, vendor_id: int, updates: dict) -> dict | None:
-    allowed = {"name", "vendor_url", "use_case"}
+    allowed = {"name", "vendor_url", "use_case", "category", "next_review_date"}
     fields = {k: v for k, v in updates.items() if k in allowed}
     if not fields:
         return await get_vendor(db, vendor_id)
+    if "category" in fields and fields["category"] is not None:
+        if fields["category"] not in VALID_CATEGORIES:
+            raise ValueError(f"Invalid category. Valid: {', '.join(sorted(VALID_CATEGORIES))}")
     set_clause = ", ".join(f"{k}=?" for k in fields)
     values = list(fields.values()) + [vendor_id]
     cur = await db.execute(f"UPDATE vendors SET {set_clause} WHERE id=?", values)
@@ -201,24 +245,29 @@ async def update_vendor(db, vendor_id: int, updates: dict) -> dict | None:
     return await get_vendor(db, vendor_id)
 
 
-async def list_vendors(db) -> list:
-    cur = await db.execute(
-        "SELECT id, name, vendor_url, use_case, created_at FROM vendors ORDER BY id DESC"
-    )
+async def list_vendors(db, category: str | None = None) -> list:
+    q = "SELECT id, name, vendor_url, use_case, category, next_review_date, created_at FROM vendors WHERE 1=1"
+    params = []
+    if category:
+        q += " AND category = ?"
+        params.append(category)
+    q += " ORDER BY id DESC"
+    cur = await db.execute(q, params)
     rows = await cur.fetchall()
     result = []
     for r in rows:
         tags = await _get_tags(db, r[0])
         result.append({
             "id": r[0], "name": r[1], "vendor_url": r[2],
-            "use_case": r[3], "tags": tags, "created_at": r[4],
+            "use_case": r[3], "category": r[4], "tags": tags,
+            "next_review_date": r[5], "created_at": r[6],
         })
     return result
 
 
 async def get_vendor(db, vendor_id: int):
     cur = await db.execute(
-        "SELECT id, name, vendor_url, use_case, created_at FROM vendors WHERE id=?",
+        "SELECT id, name, vendor_url, use_case, category, next_review_date, created_at FROM vendors WHERE id=?",
         (vendor_id,),
     )
     r = await cur.fetchone()
@@ -227,7 +276,8 @@ async def get_vendor(db, vendor_id: int):
     tags = await _get_tags(db, r[0])
     return {
         "id": r[0], "name": r[1], "vendor_url": r[2],
-        "use_case": r[3], "tags": tags, "created_at": r[4],
+        "use_case": r[3], "category": r[4], "tags": tags,
+        "next_review_date": r[5], "created_at": r[6],
     }
 
 
@@ -237,9 +287,39 @@ async def delete_vendor(db, vendor_id: int) -> bool:
         return False
     await db.execute("DELETE FROM vendor_tags WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM evaluations WHERE vendor_id=?", (vendor_id,))
+    await db.execute("DELETE FROM vendor_compliance WHERE vendor_id=?", (vendor_id,))
+    await db.execute("DELETE FROM vendor_notes WHERE vendor_id=?", (vendor_id,))
+    await db.execute("DELETE FROM vendor_contracts WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM vendors WHERE id=?", (vendor_id,))
     await db.commit()
     return True
+
+
+# ── Review Scheduling ─────────────────────────────────────────────────────────
+
+async def get_vendors_due_for_review(db, as_of: str | None = None) -> list[dict]:
+    """Return vendors whose next_review_date <= as_of (default: today)."""
+    if not as_of:
+        as_of = datetime.utcnow().strftime("%Y-%m-%d")
+    cur = await db.execute(
+        """SELECT id, name, vendor_url, use_case, category, next_review_date, created_at
+           FROM vendors
+           WHERE next_review_date IS NOT NULL AND next_review_date <= ?
+           ORDER BY next_review_date ASC""",
+        (as_of,),
+    )
+    rows = await cur.fetchall()
+    result = []
+    for r in rows:
+        tags = await _get_tags(db, r[0])
+        days_overdue = (datetime.strptime(as_of, "%Y-%m-%d") - datetime.strptime(r[5], "%Y-%m-%d")).days
+        result.append({
+            "id": r[0], "name": r[1], "vendor_url": r[2],
+            "use_case": r[3], "category": r[4], "tags": tags,
+            "next_review_date": r[5], "days_overdue": days_overdue,
+            "created_at": r[6],
+        })
+    return result
 
 
 # ── Tags ──────────────────────────────────────────────────────────────────────
@@ -282,7 +362,7 @@ async def list_all_tags(db) -> list[dict]:
 
 async def list_vendors_by_tag(db, tag: str) -> list[dict]:
     cur = await db.execute(
-        """SELECT v.id, v.name, v.vendor_url, v.use_case, v.created_at
+        """SELECT v.id, v.name, v.vendor_url, v.use_case, v.category, v.next_review_date, v.created_at
            FROM vendors v
            JOIN vendor_tags t ON t.vendor_id = v.id
            WHERE t.tag = ?
@@ -295,7 +375,8 @@ async def list_vendors_by_tag(db, tag: str) -> list[dict]:
         tags = await _get_tags(db, r[0])
         result.append({
             "id": r[0], "name": r[1], "vendor_url": r[2],
-            "use_case": r[3], "tags": tags, "created_at": r[4],
+            "use_case": r[3], "category": r[4], "tags": tags,
+            "next_review_date": r[5], "created_at": r[6],
         })
     return result
 
@@ -346,7 +427,7 @@ async def compare_vendors(db, vendor_ids: list[int]) -> list[dict]:
             result.append({
                 "vendor_id": vid, "vendor_name": vendor["name"],
                 "vendor_url": vendor["vendor_url"], "use_case": vendor["use_case"],
-                "tags": vendor["tags"],
+                "category": vendor["category"], "tags": vendor["tags"],
                 "latest_score": row[1], "risk_level": row[2],
                 "passed": row[3], "failed": row[4],
                 "critical_fails": json.loads(row[5]),
@@ -357,7 +438,7 @@ async def compare_vendors(db, vendor_ids: list[int]) -> list[dict]:
             result.append({
                 "vendor_id": vid, "vendor_name": vendor["name"],
                 "vendor_url": vendor["vendor_url"], "use_case": vendor["use_case"],
-                "tags": vendor["tags"],
+                "category": vendor["category"], "tags": vendor["tags"],
                 "latest_score": None, "risk_level": None,
                 "passed": None, "failed": None,
                 "critical_fails": [], "top_recommendations": [],
@@ -501,7 +582,6 @@ async def get_portfolio_risk(db) -> dict:
     vendors = await list_vendors(db)
     total_vendors = len(vendors)
 
-    # Get latest evaluation per vendor
     cur = await db.execute(
         """SELECT e.vendor_id, e.total_score, e.risk_level, e.critical_fails,
                   v.name
@@ -518,7 +598,6 @@ async def get_portfolio_risk(db) -> dict:
     scores = [r[1] for r in latest]
     avg_score = round(sum(scores) / len(scores), 1) if scores else 0.0
 
-    # Risk distribution
     risk_counts = Counter(r[2] for r in latest)
     distribution = []
     for level in ["critical", "high", "medium", "low"]:
@@ -529,7 +608,6 @@ async def get_portfolio_risk(db) -> dict:
             "pct": round(cnt / evaluated * 100, 1) if evaluated else 0,
         })
 
-    # Overall risk level
     if risk_counts.get("critical", 0) > 0:
         overall = "critical"
     elif avg_score >= 80:
@@ -541,7 +619,6 @@ async def get_portfolio_risk(db) -> dict:
     else:
         overall = "critical"
 
-    # Critical vendors (risk = critical or high)
     critical_vendors = []
     for r in latest:
         if r[2] in ("critical", "high"):
@@ -551,7 +628,6 @@ async def get_portfolio_risk(db) -> dict:
                 "top_fails": json.loads(r[3])[:3],
             })
 
-    # Aggregate checks and recommendations
     all_critical = []
     all_recs = []
     evals = await list_evaluations(db)
@@ -592,7 +668,6 @@ async def add_compliance(db, vendor_id: int, data: dict) -> dict:
         )
         await db.commit()
     except Exception:
-        # Update existing
         await db.execute(
             """UPDATE vendor_compliance SET status=?, expires_at=?, notes=?
                WHERE vendor_id=? AND framework=?""",
@@ -663,7 +738,6 @@ async def list_notes(db, vendor_id: int) -> list[dict]:
 # ── Risk Trend Alerts ────────────────────────────────────────────────────────
 
 async def get_risk_alerts(db, vendor_id: int, lookback: int = 5) -> dict:
-    """Check if vendor risk has degraded over the last N assessments."""
     vendor = await get_vendor(db, vendor_id)
     if not vendor:
         return None
@@ -679,7 +753,6 @@ async def get_risk_alerts(db, vendor_id: int, lookback: int = 5) -> dict:
     scores = [r[0] for r in rows]
     alerts = []
 
-    # Alert 1: Latest score dropped vs previous
     if len(scores) >= 2 and scores[0] < scores[1]:
         drop = scores[1] - scores[0]
         alerts.append({
@@ -688,7 +761,6 @@ async def get_risk_alerts(db, vendor_id: int, lookback: int = 5) -> dict:
             "message": f"Score dropped by {drop} points (from {scores[1]} to {scores[0]})",
         })
 
-    # Alert 2: Risk level worsened
     risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
     if len(rows) >= 2:
         curr_risk = risk_order.get(rows[0][1], 0)
@@ -700,7 +772,6 @@ async def get_risk_alerts(db, vendor_id: int, lookback: int = 5) -> dict:
                 "message": f"Risk level escalated from {rows[1][1]} to {rows[0][1]}",
             })
 
-    # Alert 3: Consecutive declining trend
     if len(scores) >= 3:
         declining = all(scores[i] <= scores[i+1] for i in range(len(scores)-1))
         if declining and scores[0] < scores[-1]:
@@ -710,7 +781,6 @@ async def get_risk_alerts(db, vendor_id: int, lookback: int = 5) -> dict:
                 "message": f"Score has been declining over last {len(scores)} assessments ({scores[-1]} -> {scores[0]})",
             })
 
-    # Alert 4: Score below threshold
     if scores[0] < 50:
         alerts.append({
             "type": "below_threshold",
@@ -718,7 +788,6 @@ async def get_risk_alerts(db, vendor_id: int, lookback: int = 5) -> dict:
             "message": f"Current score ({scores[0]}) is below acceptable threshold (50)",
         })
 
-    # Check expired compliance
     compliance = await list_compliance(db, vendor_id)
     for c in compliance:
         if c["status"] == "expired":
@@ -736,3 +805,138 @@ async def get_risk_alerts(db, vendor_id: int, lookback: int = 5) -> dict:
         "current_score": scores[0], "alerts": alerts,
         "trend": trend, "evaluations_checked": len(scores),
     }
+
+
+# ── Contracts ────────────────────────────────────────────────────────────────
+
+async def create_contract(db, vendor_id: int, data: dict) -> dict:
+    if data.get("contract_type") and data["contract_type"] not in VALID_CONTRACT_TYPES:
+        raise ValueError(f"Invalid contract_type. Valid: {', '.join(sorted(VALID_CONTRACT_TYPES))}")
+    now = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        """INSERT INTO vendor_contracts
+           (vendor_id, contract_value, currency, renewal_date, auto_renew, contract_type, notes, created_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (vendor_id, data["contract_value"], data.get("currency", "USD"),
+         data["renewal_date"], int(data.get("auto_renew", False)),
+         data.get("contract_type", "subscription"), data.get("notes"), now),
+    )
+    await db.commit()
+    return await get_contract(db, cur.lastrowid)
+
+
+async def get_contract(db, contract_id: int) -> dict | None:
+    cur = await db.execute("SELECT * FROM vendor_contracts WHERE id=?", (contract_id,))
+    r = await cur.fetchone()
+    if not r:
+        return None
+    return {
+        "id": r[0], "vendor_id": r[1], "contract_value": r[2], "currency": r[3],
+        "renewal_date": r[4], "auto_renew": bool(r[5]), "contract_type": r[6],
+        "notes": r[7], "created_at": r[8],
+    }
+
+
+async def list_contracts(db, vendor_id: int) -> list[dict]:
+    cur = await db.execute(
+        "SELECT * FROM vendor_contracts WHERE vendor_id=? ORDER BY renewal_date ASC",
+        (vendor_id,),
+    )
+    rows = await cur.fetchall()
+    return [
+        {"id": r[0], "vendor_id": r[1], "contract_value": r[2], "currency": r[3],
+         "renewal_date": r[4], "auto_renew": bool(r[5]), "contract_type": r[6],
+         "notes": r[7], "created_at": r[8]}
+        for r in rows
+    ]
+
+
+async def update_contract(db, contract_id: int, updates: dict) -> dict | None:
+    allowed = {"contract_value", "currency", "renewal_date", "auto_renew", "contract_type", "notes"}
+    fields = {k: v for k, v in updates.items() if k in allowed and v is not None}
+    if not fields:
+        return await get_contract(db, contract_id)
+    if "contract_type" in fields and fields["contract_type"] not in VALID_CONTRACT_TYPES:
+        raise ValueError(f"Invalid contract_type. Valid: {', '.join(sorted(VALID_CONTRACT_TYPES))}")
+    if "auto_renew" in fields:
+        fields["auto_renew"] = int(fields["auto_renew"])
+    set_clause = ", ".join(f"{k}=?" for k in fields)
+    values = list(fields.values()) + [contract_id]
+    cur = await db.execute(f"UPDATE vendor_contracts SET {set_clause} WHERE id=?", values)
+    await db.commit()
+    if cur.rowcount == 0:
+        return None
+    return await get_contract(db, contract_id)
+
+
+async def delete_contract(db, contract_id: int) -> bool:
+    cur = await db.execute("DELETE FROM vendor_contracts WHERE id=?", (contract_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def get_expiring_contracts(db, within_days: int = 30) -> list[dict]:
+    """Return contracts expiring within N days."""
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    from datetime import timedelta
+    deadline = (datetime.utcnow() + timedelta(days=within_days)).strftime("%Y-%m-%d")
+    cur = await db.execute(
+        """SELECT c.*, v.name as vendor_name
+           FROM vendor_contracts c
+           JOIN vendors v ON v.id = c.vendor_id
+           WHERE c.renewal_date >= ? AND c.renewal_date <= ?
+           ORDER BY c.renewal_date ASC""",
+        (today, deadline),
+    )
+    rows = await cur.fetchall()
+    result = []
+    for r in rows:
+        days_until = (datetime.strptime(r[4], "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days
+        result.append({
+            "id": r[0], "vendor_id": r[1], "vendor_name": r[9],
+            "contract_value": r[2], "currency": r[3],
+            "renewal_date": r[4], "auto_renew": bool(r[5]),
+            "contract_type": r[6], "notes": r[7],
+            "days_until_renewal": days_until,
+        })
+    return result
+
+
+# ── Category Stats ───────────────────────────────────────────────────────────
+
+async def get_category_stats(db) -> list[dict]:
+    """Per-category vendor count, average score, risk distribution."""
+    cur = await db.execute(
+        "SELECT COALESCE(category, 'uncategorized') as cat, COUNT(*) as cnt FROM vendors GROUP BY cat ORDER BY cnt DESC"
+    )
+    categories = await cur.fetchall()
+    result = []
+    for cat_row in categories:
+        cat = cat_row[0]
+        count = cat_row[1]
+        # Get latest eval scores for vendors in this category
+        if cat == "uncategorized":
+            score_cur = await db.execute(
+                """SELECT e.total_score, e.risk_level FROM evaluations e
+                   JOIN vendors v ON v.id = e.vendor_id
+                   WHERE v.category IS NULL
+                   AND e.id IN (SELECT MAX(id) FROM evaluations GROUP BY vendor_id)"""
+            )
+        else:
+            score_cur = await db.execute(
+                """SELECT e.total_score, e.risk_level FROM evaluations e
+                   JOIN vendors v ON v.id = e.vendor_id
+                   WHERE v.category = ?
+                   AND e.id IN (SELECT MAX(id) FROM evaluations GROUP BY vendor_id)""",
+                (cat,),
+            )
+        eval_rows = await score_cur.fetchall()
+        scores = [r[0] for r in eval_rows]
+        risk_dist = dict(Counter(r[1] for r in eval_rows))
+        result.append({
+            "category": cat,
+            "vendor_count": count,
+            "avg_score": round(sum(scores) / len(scores), 1) if scores else None,
+            "risk_distribution": risk_dist,
+        })
+    return result

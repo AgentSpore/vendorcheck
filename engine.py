@@ -1,6 +1,6 @@
 import aiosqlite
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import Counter
 
 DB_PATH = "vendorcheck.db"
@@ -11,6 +11,8 @@ VALID_CATEGORIES = {
 }
 
 VALID_CONTRACT_TYPES = {"subscription", "perpetual", "usage_based", "enterprise"}
+
+VALID_DEPENDENCY_TYPES = {"critical", "important", "optional"}
 
 CRITICAL_FIELDS = [
     "gdpr_compliant",
@@ -122,6 +124,27 @@ async def init_db():
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_contracts_renewal ON vendor_contracts(renewal_date)"
+        )
+
+        # -- v1.7.0: vendor dependencies table --
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS vendor_dependencies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_id INTEGER NOT NULL,
+                depends_on_id INTEGER NOT NULL,
+                dependency_type TEXT NOT NULL DEFAULT 'important',
+                description TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE CASCADE,
+                FOREIGN KEY (depends_on_id) REFERENCES vendors(id) ON DELETE CASCADE,
+                UNIQUE(vendor_id, depends_on_id)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deps_vendor ON vendor_dependencies(vendor_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_deps_target ON vendor_dependencies(depends_on_id)"
         )
 
         # migrate: add category and next_review_date columns if missing
@@ -290,6 +313,7 @@ async def delete_vendor(db, vendor_id: int) -> bool:
     await db.execute("DELETE FROM vendor_compliance WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM vendor_notes WHERE vendor_id=?", (vendor_id,))
     await db.execute("DELETE FROM vendor_contracts WHERE vendor_id=?", (vendor_id,))
+    await db.execute("DELETE FROM vendor_dependencies WHERE vendor_id=? OR depends_on_id=?", (vendor_id, vendor_id))
     await db.execute("DELETE FROM vendors WHERE id=?", (vendor_id,))
     await db.commit()
     return True
@@ -522,7 +546,7 @@ async def list_evaluations(db, vendor_id=None) -> list:
 async def get_evaluation(db, eval_id: int):
     cur = await db.execute(
         """SELECT e.id, e.vendor_id, v.name, e.total_score, e.risk_level,
-                  e.passed, e.failed, e.critical_fails, e.recommendations, e.created_at
+                  e.passed, e.failed, e.critical_fails, e.recommendations, e.answers, e.created_at
            FROM evaluations e LEFT JOIN vendors v ON v.id=e.vendor_id WHERE e.id=?""",
         (eval_id,),
     )
@@ -534,7 +558,9 @@ async def get_evaluation(db, eval_id: int):
         "total_score": r[3], "risk_level": r[4],
         "passed": r[5], "failed": r[6],
         "critical_fails": json.loads(r[7]),
-        "recommendations": json.loads(r[8]), "created_at": r[9],
+        "recommendations": json.loads(r[8]),
+        "answers": json.loads(r[9]) if r[9] else {},
+        "created_at": r[10],
     }
 
 
@@ -878,7 +904,6 @@ async def delete_contract(db, contract_id: int) -> bool:
 async def get_expiring_contracts(db, within_days: int = 30) -> list[dict]:
     """Return contracts expiring within N days."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    from datetime import timedelta
     deadline = (datetime.utcnow() + timedelta(days=within_days)).strftime("%Y-%m-%d")
     cur = await db.execute(
         """SELECT c.*, v.name as vendor_name
@@ -914,7 +939,6 @@ async def get_category_stats(db) -> list[dict]:
     for cat_row in categories:
         cat = cat_row[0]
         count = cat_row[1]
-        # Get latest eval scores for vendors in this category
         if cat == "uncategorized":
             score_cur = await db.execute(
                 """SELECT e.total_score, e.risk_level FROM evaluations e
@@ -940,3 +964,285 @@ async def get_category_stats(db) -> list[dict]:
             "risk_distribution": risk_dist,
         })
     return result
+
+
+# ── v1.7.0: Vendor Dependencies ──────────────────────────────────────────────
+
+async def _get_latest_eval(db, vendor_id: int) -> dict | None:
+    cur = await db.execute(
+        "SELECT total_score, risk_level FROM evaluations WHERE vendor_id=? ORDER BY id DESC LIMIT 1",
+        (vendor_id,),
+    )
+    r = await cur.fetchone()
+    if not r:
+        return None
+    return {"score": r[0], "risk_level": r[1]}
+
+
+async def add_dependency(db, vendor_id: int, depends_on_id: int, dependency_type: str, description: str | None) -> dict:
+    if dependency_type not in VALID_DEPENDENCY_TYPES:
+        raise ValueError(f"Invalid dependency_type. Valid: {', '.join(sorted(VALID_DEPENDENCY_TYPES))}")
+    if vendor_id == depends_on_id:
+        raise ValueError("A vendor cannot depend on itself")
+    dep_vendor = await get_vendor(db, depends_on_id)
+    if not dep_vendor:
+        raise ValueError(f"Depends-on vendor {depends_on_id} not found")
+    now = datetime.utcnow().isoformat()
+    try:
+        cur = await db.execute(
+            """INSERT INTO vendor_dependencies (vendor_id, depends_on_id, dependency_type, description, created_at)
+               VALUES (?,?,?,?,?)""",
+            (vendor_id, depends_on_id, dependency_type, description, now),
+        )
+        await db.commit()
+    except Exception:
+        raise ValueError(f"Dependency already exists between vendor {vendor_id} and {depends_on_id}")
+    return await get_dependency(db, cur.lastrowid)
+
+
+async def get_dependency(db, dep_id: int) -> dict | None:
+    cur = await db.execute(
+        """SELECT d.id, d.vendor_id, d.depends_on_id, v.name, d.dependency_type,
+                  d.description, d.created_at
+           FROM vendor_dependencies d
+           JOIN vendors v ON v.id = d.depends_on_id
+           WHERE d.id = ?""",
+        (dep_id,),
+    )
+    r = await cur.fetchone()
+    if not r:
+        return None
+    eval_info = await _get_latest_eval(db, r[2])
+    return {
+        "id": r[0], "vendor_id": r[1], "depends_on_id": r[2],
+        "depends_on_name": r[3], "dependency_type": r[4],
+        "description": r[5],
+        "depends_on_risk_level": eval_info["risk_level"] if eval_info else None,
+        "depends_on_score": eval_info["score"] if eval_info else None,
+        "created_at": r[6],
+    }
+
+
+async def list_dependencies(db, vendor_id: int) -> list[dict]:
+    cur = await db.execute(
+        """SELECT d.id, d.vendor_id, d.depends_on_id, v.name, d.dependency_type,
+                  d.description, d.created_at
+           FROM vendor_dependencies d
+           JOIN vendors v ON v.id = d.depends_on_id
+           WHERE d.vendor_id = ?
+           ORDER BY d.dependency_type, v.name""",
+        (vendor_id,),
+    )
+    rows = await cur.fetchall()
+    result = []
+    for r in rows:
+        eval_info = await _get_latest_eval(db, r[2])
+        result.append({
+            "id": r[0], "vendor_id": r[1], "depends_on_id": r[2],
+            "depends_on_name": r[3], "dependency_type": r[4],
+            "description": r[5],
+            "depends_on_risk_level": eval_info["risk_level"] if eval_info else None,
+            "depends_on_score": eval_info["score"] if eval_info else None,
+            "created_at": r[6],
+        })
+    return result
+
+
+async def remove_dependency(db, vendor_id: int, dep_id: int) -> bool:
+    cur = await db.execute(
+        "DELETE FROM vendor_dependencies WHERE id=? AND vendor_id=?", (dep_id, vendor_id)
+    )
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def get_dependency_tree(db, vendor_id: int, max_depth: int = 5) -> dict | None:
+    vendor = await get_vendor(db, vendor_id)
+    if not vendor:
+        return None
+    eval_info = await _get_latest_eval(db, vendor_id)
+
+    async def _build_tree(vid: int, depth: int, visited: set) -> dict:
+        v = await get_vendor(db, vid)
+        ev = await _get_latest_eval(db, vid)
+        node = {
+            "vendor_id": vid,
+            "vendor_name": v["name"] if v else "unknown",
+            "risk_level": ev["risk_level"] if ev else None,
+            "score": ev["score"] if ev else None,
+            "dependencies": [],
+        }
+        if depth >= max_depth or vid in visited:
+            return node
+        visited.add(vid)
+        deps = await list_dependencies(db, vid)
+        for d in deps:
+            child = await _build_tree(d["depends_on_id"], depth + 1, visited)
+            child["dependency_type"] = d["dependency_type"]
+            node["dependencies"].append(child)
+        return node
+
+    tree = await _build_tree(vendor_id, 0, set())
+
+    # Collect chain info
+    all_nodes = []
+    critical_chain = []
+    risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+    def _walk(node, depth=0):
+        all_nodes.append(node)
+        if node.get("risk_level") in ("critical", "high") and node["vendor_id"] != vendor_id:
+            critical_chain.append({
+                "vendor_id": node["vendor_id"],
+                "vendor_name": node["vendor_name"],
+                "risk_level": node["risk_level"],
+                "score": node["score"],
+                "dependency_type": node.get("dependency_type"),
+            })
+        for child in node.get("dependencies", []):
+            _walk(child, depth + 1)
+
+    _walk(tree)
+
+    direct_deps = len(tree["dependencies"])
+    risks = [n["risk_level"] for n in all_nodes if n["risk_level"]]
+    highest = max(risks, key=lambda r: risk_order.get(r, 0)) if risks else None
+
+    return {
+        "vendor_id": vendor_id,
+        "vendor_name": vendor["name"],
+        "direct_dependencies": direct_deps,
+        "total_chain_length": len(all_nodes) - 1,
+        "highest_chain_risk": highest,
+        "critical_chain_vendors": critical_chain,
+        "tree": tree,
+    }
+
+
+# ── v1.7.0: Compliance Calendar & Matrix ─────────────────────────────────────
+
+async def get_compliance_calendar(db, within_days: int = 90) -> dict:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    deadline = (datetime.utcnow() + timedelta(days=within_days)).strftime("%Y-%m-%d")
+
+    cur = await db.execute(
+        """SELECT c.vendor_id, v.name, c.framework, c.status, c.expires_at
+           FROM vendor_compliance c
+           JOIN vendors v ON v.id = c.vendor_id
+           WHERE c.expires_at IS NOT NULL
+           ORDER BY c.expires_at ASC"""
+    )
+    rows = await cur.fetchall()
+
+    entries = []
+    expired_count = 0
+    expiring_soon_count = 0
+
+    for r in rows:
+        expires = r[4]
+        days_until = (datetime.strptime(expires, "%Y-%m-%d") - datetime.strptime(today, "%Y-%m-%d")).days
+
+        if days_until < 0:
+            urgency = "expired"
+            expired_count += 1
+        elif days_until <= 30:
+            urgency = "critical"
+            expiring_soon_count += 1
+        elif days_until <= 60:
+            urgency = "warning"
+            expiring_soon_count += 1
+        elif days_until <= within_days:
+            urgency = "upcoming"
+        else:
+            continue
+
+        entries.append({
+            "vendor_id": r[0], "vendor_name": r[1],
+            "framework": r[2], "status": r[3],
+            "expires_at": expires, "days_until_expiry": days_until,
+            "urgency": urgency,
+        })
+
+    return {
+        "entries": entries,
+        "total_expiring": len(entries),
+        "expired_count": expired_count,
+        "expiring_soon_count": expiring_soon_count,
+    }
+
+
+async def get_compliance_matrix(db) -> dict:
+    vendors = await list_vendors(db)
+    all_frameworks_set = set()
+    matrix = []
+
+    for v in vendors:
+        compliance = await list_compliance(db, v["id"])
+        fw_map = {}
+        for c in compliance:
+            fw_map[c["framework"]] = c["status"]
+            all_frameworks_set.add(c["framework"])
+        matrix.append({
+            "vendor_id": v["id"],
+            "vendor_name": v["name"],
+            "frameworks": fw_map,
+        })
+
+    all_fw = sorted(all_frameworks_set)
+    total_cells = len(vendors) * len(all_fw) if all_fw else 0
+    covered = sum(len(m["frameworks"]) for m in matrix)
+    coverage_pct = round(covered / total_cells * 100, 1) if total_cells else 0.0
+
+    return {
+        "vendors": matrix,
+        "all_frameworks": all_fw,
+        "total_vendors": len(vendors),
+        "coverage_pct": coverage_pct,
+    }
+
+
+# ── v1.7.0: Assessment Diff ─────────────────────────────────────────────────
+
+async def diff_evaluations(db, eval_a_id: int, eval_b_id: int) -> dict | None:
+    a = await get_evaluation(db, eval_a_id)
+    b = await get_evaluation(db, eval_b_id)
+    if not a or not b:
+        return None
+
+    answers_a = a.get("answers", {})
+    answers_b = b.get("answers", {})
+
+    all_fields = sorted(set(list(answers_a.keys()) + list(answers_b.keys())))
+    field_diffs = []
+    for field in all_fields:
+        val_a = str(answers_a.get(field, "N/A"))
+        val_b = str(answers_b.get(field, "N/A"))
+        field_diffs.append({
+            "field": field,
+            "eval_a": val_a,
+            "eval_b": val_b,
+            "changed": val_a != val_b,
+        })
+
+    crit_a = set(a["critical_fails"])
+    crit_b = set(b["critical_fails"])
+    rec_a = set(a["recommendations"])
+    rec_b = set(b["recommendations"])
+
+    return {
+        "eval_a_id": eval_a_id,
+        "eval_b_id": eval_b_id,
+        "eval_a_vendor": a["vendor_name"],
+        "eval_b_vendor": b["vendor_name"],
+        "score_a": a["total_score"],
+        "score_b": b["total_score"],
+        "score_delta": b["total_score"] - a["total_score"],
+        "risk_a": a["risk_level"],
+        "risk_b": b["risk_level"],
+        "risk_changed": a["risk_level"] != b["risk_level"],
+        "fields": field_diffs,
+        "new_critical_fails": sorted(crit_b - crit_a),
+        "resolved_critical_fails": sorted(crit_a - crit_b),
+        "new_recommendations": sorted(rec_b - rec_a),
+        "resolved_recommendations": sorted(rec_a - rec_b),
+    }

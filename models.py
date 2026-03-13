@@ -237,3 +237,97 @@ class CategoryStats(BaseModel):
     vendor_count: int
     avg_score: Optional[float]
     risk_distribution: dict
+
+
+# ── v1.7.0: Dependencies, Compliance Calendar, Assessment Diff ───────────────
+
+class DependencyCreate(BaseModel):
+    depends_on_id: int = Field(..., description="ID of the vendor this vendor depends on")
+    dependency_type: str = Field("important", description="critical | important | optional")
+    description: Optional[str] = Field(None, max_length=500)
+
+
+class DependencyResponse(BaseModel):
+    id: int
+    vendor_id: int
+    depends_on_id: int
+    depends_on_name: str
+    dependency_type: str
+    description: Optional[str]
+    depends_on_risk_level: Optional[str]
+    depends_on_score: Optional[int]
+    created_at: str
+
+
+class DependencyTreeNode(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    risk_level: Optional[str]
+    score: Optional[int]
+    dependency_type: Optional[str] = None
+    dependencies: List["DependencyTreeNode"] = []
+
+
+class CascadeRiskResponse(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    direct_dependencies: int
+    total_chain_length: int
+    highest_chain_risk: Optional[str]
+    critical_chain_vendors: List[dict]
+    tree: DependencyTreeNode
+
+
+class ComplianceCalendarEntry(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    framework: str
+    status: str
+    expires_at: str
+    days_until_expiry: int
+    urgency: str
+
+
+class ComplianceCalendarResponse(BaseModel):
+    entries: List[ComplianceCalendarEntry]
+    total_expiring: int
+    expired_count: int
+    expiring_soon_count: int
+
+
+class ComplianceMatrixEntry(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    frameworks: dict
+
+
+class ComplianceMatrixResponse(BaseModel):
+    vendors: List[ComplianceMatrixEntry]
+    all_frameworks: List[str]
+    total_vendors: int
+    coverage_pct: float
+
+
+class EvalDiffField(BaseModel):
+    field: str
+    eval_a: Optional[str]
+    eval_b: Optional[str]
+    changed: bool
+
+
+class EvalDiffResponse(BaseModel):
+    eval_a_id: int
+    eval_b_id: int
+    eval_a_vendor: str
+    eval_b_vendor: str
+    score_a: int
+    score_b: int
+    score_delta: int
+    risk_a: str
+    risk_b: str
+    risk_changed: bool
+    fields: List[EvalDiffField]
+    new_critical_fails: List[str]
+    resolved_critical_fails: List[str]
+    new_recommendations: List[str]
+    resolved_recommendations: List[str]

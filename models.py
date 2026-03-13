@@ -140,3 +140,54 @@ class PortfolioRisk(BaseModel):
     critical_vendors: List[CriticalVendor]
     top_critical_checks: List[dict]
     top_recommendations: List[dict]
+
+
+# ── Compliance ────────────────────────────────────────────────────────────────
+
+class ComplianceCreate(BaseModel):
+    framework: str = Field(..., description="Framework: gdpr | soc2 | hipaa | iso27001 | pci-dss | ccpa | fedramp")
+    status: str = Field("pending", description="Status: pending | certified | expired | in_progress | not_applicable")
+    expires_at: Optional[str] = Field(None, description="Certification expiry date (ISO)")
+    notes: Optional[str] = None
+
+
+class ComplianceResponse(BaseModel):
+    id: int
+    vendor_id: int
+    framework: str
+    status: str
+    expires_at: Optional[str]
+    notes: Optional[str]
+    created_at: str
+
+
+# ── Notes ─────────────────────────────────────────────────────────────────────
+
+class NoteCreate(BaseModel):
+    note: str = Field(..., min_length=1, max_length=2000)
+    author: Optional[str] = Field(None, max_length=100)
+
+
+class NoteResponse(BaseModel):
+    id: int
+    vendor_id: int
+    note: str
+    author: Optional[str]
+    created_at: str
+
+
+# ── Risk Alerts ───────────────────────────────────────────────────────────────
+
+class RiskAlert(BaseModel):
+    type: str
+    severity: str
+    message: str
+
+
+class RiskAlertsResponse(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    current_score: Optional[int] = None
+    alerts: List[RiskAlert]
+    trend: str
+    evaluations_checked: int

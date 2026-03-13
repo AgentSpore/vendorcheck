@@ -70,6 +70,30 @@ async def init_db():
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_tags_tag ON vendor_tags(tag)"
         )
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS vendor_compliance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_id INTEGER NOT NULL,
+                framework TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                expires_at TEXT,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE CASCADE,
+                UNIQUE(vendor_id, framework)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS vendor_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                vendor_id INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                author TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (vendor_id) REFERENCES vendors(id) ON DELETE CASCADE
+            )
+        """)
         await db.commit()
 
 
@@ -548,4 +572,167 @@ async def get_portfolio_risk(db) -> dict:
         "critical_vendors": critical_vendors,
         "top_critical_checks": top_checks,
         "top_recommendations": top_recs,
+    }
+
+
+# ── Compliance ───────────────────────────────────────────────────────────────
+
+VALID_FRAMEWORKS = {"gdpr", "soc2", "hipaa", "iso27001", "pci-dss", "ccpa", "fedramp"}
+VALID_COMPLIANCE_STATUS = {"pending", "certified", "expired", "in_progress", "not_applicable"}
+
+
+async def add_compliance(db, vendor_id: int, data: dict) -> dict:
+    now = datetime.utcnow().isoformat()
+    try:
+        cur = await db.execute(
+            """INSERT INTO vendor_compliance (vendor_id, framework, status, expires_at, notes, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (vendor_id, data["framework"], data.get("status", "pending"),
+             data.get("expires_at"), data.get("notes"), now),
+        )
+        await db.commit()
+    except Exception:
+        # Update existing
+        await db.execute(
+            """UPDATE vendor_compliance SET status=?, expires_at=?, notes=?
+               WHERE vendor_id=? AND framework=?""",
+            (data.get("status", "pending"), data.get("expires_at"), data.get("notes"),
+             vendor_id, data["framework"]),
+        )
+        await db.commit()
+        cur2 = await db.execute(
+            "SELECT id FROM vendor_compliance WHERE vendor_id=? AND framework=?",
+            (vendor_id, data["framework"]),
+        )
+        row = await cur2.fetchone()
+        return await get_compliance_entry(db, row[0]) if row else {}
+    return await get_compliance_entry(db, cur.lastrowid)
+
+
+async def get_compliance_entry(db, entry_id: int) -> dict:
+    cur = await db.execute("SELECT * FROM vendor_compliance WHERE id=?", (entry_id,))
+    r = await cur.fetchone()
+    if not r:
+        return {}
+    return {
+        "id": r[0], "vendor_id": r[1], "framework": r[2], "status": r[3],
+        "expires_at": r[4], "notes": r[5], "created_at": r[6],
+    }
+
+
+async def list_compliance(db, vendor_id: int) -> list[dict]:
+    cur = await db.execute(
+        "SELECT * FROM vendor_compliance WHERE vendor_id=? ORDER BY framework", (vendor_id,)
+    )
+    rows = await cur.fetchall()
+    return [{"id": r[0], "vendor_id": r[1], "framework": r[2], "status": r[3],
+             "expires_at": r[4], "notes": r[5], "created_at": r[6]} for r in rows]
+
+
+async def remove_compliance(db, vendor_id: int, framework: str) -> bool:
+    cur = await db.execute(
+        "DELETE FROM vendor_compliance WHERE vendor_id=? AND framework=?", (vendor_id, framework)
+    )
+    await db.commit()
+    return cur.rowcount > 0
+
+
+# ── Notes ────────────────────────────────────────────────────────────────────
+
+async def add_note(db, vendor_id: int, note: str, author: str | None = None) -> dict:
+    now = datetime.utcnow().isoformat()
+    cur = await db.execute(
+        "INSERT INTO vendor_notes (vendor_id, note, author, created_at) VALUES (?,?,?,?)",
+        (vendor_id, note, author, now),
+    )
+    await db.commit()
+    return {"id": cur.lastrowid, "vendor_id": vendor_id, "note": note,
+            "author": author, "created_at": now}
+
+
+async def list_notes(db, vendor_id: int) -> list[dict]:
+    cur = await db.execute(
+        "SELECT id, vendor_id, note, author, created_at FROM vendor_notes WHERE vendor_id=? ORDER BY id DESC",
+        (vendor_id,),
+    )
+    rows = await cur.fetchall()
+    return [{"id": r[0], "vendor_id": r[1], "note": r[2], "author": r[3], "created_at": r[4]}
+            for r in rows]
+
+
+# ── Risk Trend Alerts ────────────────────────────────────────────────────────
+
+async def get_risk_alerts(db, vendor_id: int, lookback: int = 5) -> dict:
+    """Check if vendor risk has degraded over the last N assessments."""
+    vendor = await get_vendor(db, vendor_id)
+    if not vendor:
+        return None
+    cur = await db.execute(
+        "SELECT total_score, risk_level, created_at FROM evaluations WHERE vendor_id=? ORDER BY id DESC LIMIT ?",
+        (vendor_id, lookback),
+    )
+    rows = await cur.fetchall()
+    if not rows:
+        return {"vendor_id": vendor_id, "vendor_name": vendor["name"],
+                "alerts": [], "trend": "no_data", "evaluations_checked": 0}
+
+    scores = [r[0] for r in rows]
+    alerts = []
+
+    # Alert 1: Latest score dropped vs previous
+    if len(scores) >= 2 and scores[0] < scores[1]:
+        drop = scores[1] - scores[0]
+        alerts.append({
+            "type": "score_drop",
+            "severity": "high" if drop >= 15 else "medium",
+            "message": f"Score dropped by {drop} points (from {scores[1]} to {scores[0]})",
+        })
+
+    # Alert 2: Risk level worsened
+    risk_order = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+    if len(rows) >= 2:
+        curr_risk = risk_order.get(rows[0][1], 0)
+        prev_risk = risk_order.get(rows[1][1], 0)
+        if curr_risk > prev_risk:
+            alerts.append({
+                "type": "risk_escalation",
+                "severity": "high",
+                "message": f"Risk level escalated from {rows[1][1]} to {rows[0][1]}",
+            })
+
+    # Alert 3: Consecutive declining trend
+    if len(scores) >= 3:
+        declining = all(scores[i] <= scores[i+1] for i in range(len(scores)-1))
+        if declining and scores[0] < scores[-1]:
+            alerts.append({
+                "type": "declining_trend",
+                "severity": "medium",
+                "message": f"Score has been declining over last {len(scores)} assessments ({scores[-1]} -> {scores[0]})",
+            })
+
+    # Alert 4: Score below threshold
+    if scores[0] < 50:
+        alerts.append({
+            "type": "below_threshold",
+            "severity": "critical" if scores[0] < 30 else "high",
+            "message": f"Current score ({scores[0]}) is below acceptable threshold (50)",
+        })
+
+    # Check expired compliance
+    compliance = await list_compliance(db, vendor_id)
+    for c in compliance:
+        if c["status"] == "expired":
+            alerts.append({
+                "type": "compliance_expired",
+                "severity": "high",
+                "message": f"Compliance certification '{c['framework']}' has expired",
+            })
+
+    trend = "declining" if len(scores) >= 2 and scores[0] < scores[-1] else (
+        "improving" if len(scores) >= 2 and scores[0] > scores[-1] else "stable")
+
+    return {
+        "vendor_id": vendor_id, "vendor_name": vendor["name"],
+        "current_score": scores[0], "alerts": alerts,
+        "trend": trend, "evaluations_checked": len(scores),
     }

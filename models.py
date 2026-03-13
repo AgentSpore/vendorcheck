@@ -14,6 +14,7 @@ class VendorResponse(BaseModel):
     name: str
     vendor_url: Optional[str] = None
     use_case: Optional[str] = None
+    tags: List[str] = []
     created_at: datetime
 
     model_config = {"from_attributes": True}
@@ -95,3 +96,47 @@ class VendorHistory(BaseModel):
     latest_score: Optional[int] = None
     best_score: Optional[int] = None
     worst_score: Optional[int] = None
+
+
+# ── Tags ──────────────────────────────────────────────────────────────────────
+
+class TagAdd(BaseModel):
+    tag: str = Field(..., min_length=1, max_length=50, pattern=r"^[a-z0-9_-]+$")
+
+
+class TagListResponse(BaseModel):
+    vendor_id: int
+    tags: List[str]
+
+
+class TagSummary(BaseModel):
+    tag: str
+    vendor_count: int
+
+
+# ── Portfolio ─────────────────────────────────────────────────────────────────
+
+class RiskBucket(BaseModel):
+    level: str
+    count: int
+    pct: float
+
+
+class CriticalVendor(BaseModel):
+    vendor_id: int
+    vendor_name: str
+    score: int
+    risk_level: str
+    top_fails: List[str]
+
+
+class PortfolioRisk(BaseModel):
+    total_vendors: int
+    evaluated_vendors: int
+    unevaluated_vendors: int
+    avg_score: float
+    overall_risk_level: str
+    risk_distribution: List[RiskBucket]
+    critical_vendors: List[CriticalVendor]
+    top_critical_checks: List[dict]
+    top_recommendations: List[dict]
